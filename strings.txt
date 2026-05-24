@@ -1,0 +1,117 @@
+PLUGIN_NOWPLAYINGDISPLAY
+	EN	Now Playing Display
+
+PLUGIN_NOWPLAYINGDISPLAY_DESC
+	EN	A standalone now-playing display page for any browser — tablets, TVs, kiosks. Pick a player from the dropdown on the page.
+
+PLUGIN_NOWPLAYINGDISPLAY_PAGE_URL
+	EN	Page URL
+
+PLUGIN_NOWPLAYINGDISPLAY_PAGE_URL_DESC
+	EN	Open this on any browser (wall tablet, Fire Stick, laptop) to see now-playing info.
+
+PLUGIN_NOWPLAYINGDISPLAY_URLS
+	EN	Display URLs
+
+PLUGIN_NOWPLAYINGDISPLAY_GENERAL_URL_DESC
+	EN	The general display URL. Open this on any browser. By default it auto-follows the most active player, or the player chosen in the on-page picker.
+
+PLUGIN_NOWPLAYINGDISPLAY_PLAYER_URLS
+	EN	Per-player URLs
+
+PLUGIN_NOWPLAYINGDISPLAY_PLAYER_URLS_DESC
+	EN	Per-player URLs. Bookmark one of these on a specific device (e.g. a kitchen tablet) to lock that display to a single player.
+
+PLUGIN_NOWPLAYINGDISPLAY_DISPLAY
+	EN	Display
+
+PLUGIN_NOWPLAYINGDISPLAY_DEFAULT_MODE
+	EN	Default mode
+
+PLUGIN_NOWPLAYINGDISPLAY_DEFAULT_MODE_DESC
+	EN	The mode shown when a display is opened for the first time. Each device remembers its own choice afterwards, so this is just the default for new displays.
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_NOWPLAYING
+	EN	Now playing
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_ARTWORK
+	EN	Artwork
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_LYRICS
+	EN	Lyrics
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_AMBIENT
+	EN	Ambient
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_VINYL
+	EN	Vinyl
+
+PLUGIN_NOWPLAYINGDISPLAY_MODE_BIOGRAPHY
+	EN	Biography
+
+PLUGIN_NOWPLAYINGDISPLAY_SCROLL_SPEED
+	EN	Biography auto-scroll speed
+
+PLUGIN_NOWPLAYINGDISPLAY_SCROLL_SPEED_DESC
+	EN	How fast the biography text auto-scrolls when it doesn't fit on screen.
+
+PLUGIN_NOWPLAYINGDISPLAY_SCROLL_LOW
+	EN	Low (30 px/s) — relaxed reading pace
+
+PLUGIN_NOWPLAYINGDISPLAY_SCROLL_MEDIUM
+	EN	Medium (50 px/s) — comfortable
+
+PLUGIN_NOWPLAYINGDISPLAY_SCROLL_HIGH
+	EN	High (80 px/s) — quicker visibility
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ
+	EN	Audio visualizer (experimental)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_DESC
+	EN	Adds a Visualizer display mode that reacts to the actual music. To do this the display quietly streams the current track to itself (muted) and analyses it. It does not affect your players, register a player, or change playback — it only listens. Note: it uses some network bandwidth and asks the server to transcode the current track to MP3, which is a small extra load on the server. Leave off to keep the display a passive viewer.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_LABEL
+	EN	Enable the Visualizer mode
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY
+	EN	Default visualizer sync offset (ms)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY_DESC
+	EN	Fallback offset used when a player has no preset assigned. Positive pushes the visualization earlier (use if it lags the sound), negative later. Range -2000 to 2000. Note: very low bass naturally resolves a little later than treble in any FFT analyzer — that part isn't corrected by this offset.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS
+	EN	Visualizer delay presets
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS_DESC
+	EN	Define named sync-offset presets (in milliseconds) below, then pick one from the "Visualizer offset" dropdown next to each player above. This lets each room or display device keep its own dialled-in delay. First time: add a preset and Save — the new preset then appears in every player's dropdown, so choose one and Save again. Positive = visualization earlier, negative = later. Leave a row blank to remove that preset.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_NAME
+	EN	Preset name
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_MS
+	EN	Offset (ms)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_NONE
+	EN	Default
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PLAYER_OFFSET
+	EN	Visualizer offset:
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH
+	EN	Visualizer meter responsiveness
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_DESC
+	EN	How quickly the spectrum bars rise and fall. "Lively" reacts fast and snappy; "Smooth" and "Very smooth" add more decay so the bars settle and hang more gently. Applies live — adjust and Save while watching to find the feel you like.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_LIVELY
+	EN	Lively (fast, snappy)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_MEDIUM
+	EN	Medium (balanced)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_SMOOTH
+	EN	Smooth (more decay)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_VERY
+	EN	Very smooth (gentle, lingering)
+
