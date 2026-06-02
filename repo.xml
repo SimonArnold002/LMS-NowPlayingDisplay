@@ -6,7 +6,7 @@
     <plugin name="NowPlayingSDisplay" version="0.19.5.0" minTarget="8.0.0" maxTarget="*">
       <title lang="EN">Now Playing Share</title>
       <desc lang="EN">Use Browser to Display Now Playing and Visualisers to your TV</desc>
-      <url>https://github.com/SimonArnold002/LMS-Now-Playing-Display/blob/main/NowPlayingDisplay.zip</url>
+      <url>https://simonarnold002.github.io/LMS-NowPlayingDisplay/NowPlayingDisplay.zip/url>
       <creator>CrystalGipsy</creator>
       <email></email>
       <sha>253b490cef5133177989cd9b193fa8891766b8ae</sha>
