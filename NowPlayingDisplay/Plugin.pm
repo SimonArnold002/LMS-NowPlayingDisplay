@@ -25,6 +25,7 @@ use Slim::Utils::Prefs;
 use Slim::Web::Pages;
 use Slim::Web::HTTP;
 use Slim::Control::Request;
+use Slim::Networking::SimpleAsyncHTTP;
 
 my $log = Slim::Utils::Log->addLogCategory({
     category     => 'plugin.nowplayingdisplay',
@@ -41,6 +42,7 @@ $prefs->init({
     enableVisualizer => 0,          # opt-in: stream muted audio to react to it
     vizDelayMs     => 80,           # visualizer sync offset, signed ms
     vizSmoothing   => 'medium',     # meter responsiveness: lively|medium|smooth|verysmooth
+    vizStyle       => 'segmented',  # visualizer style: segmented|radial|scope
 });
 
 sub initPlugin {
@@ -78,6 +80,15 @@ sub initPlugin {
     );
     Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/setoffset\b},     \&_handleSetOffset,
+    );
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/setstyle\b},      \&_handleSetStyle,
+    );
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/streamurl\b},     \&_handleStreamUrl,
+    );
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/streamproxy\b},   \&_handleStreamProxy,
     );
     Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/page\b},          \&_handlePage,
@@ -228,6 +239,11 @@ sub _snapshotFor {
     $snap->{duration} ||= ($remote->{duration} // 0) + 0;
     $snap->{track_url} ||= $remote->{url}     // '';
 
+    # The resolved stream URL for remote tracks is NOT read here (that would
+    # touch the live song object on every poll). The visualizer fetches it
+    # on demand, once per track, via the /streamurl endpoint instead.
+    $snap->{stream_url} = '';
+
     # Artwork resolution — order matters:
     #   1. artwork_url: streaming services and remote tracks all set this to
     #      an LMS imageproxy path like '/imageproxy/<encoded URL>/image.jpg'.
@@ -296,6 +312,135 @@ sub _handleSetOffset {
           encode_json({ ok => \1, ms => $ms }), no_cache => 1);
 }
 
+# Persist the visualizer style from the on-screen Style button.
+sub _handleSetStyle {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $style = $q{style} // '';
+    my %valid = map { $_ => 1 } qw(segmented scope starburst bokeh);
+    $style = 'segmented' unless $valid{$style};
+    $prefs->set('vizStyle', $style);
+    _send($httpClient, $response, 'application/json',
+          encode_json({ ok => \1, style => $style }), no_cache => 1);
+}
+
+# On-demand resolved stream URL for the visualizer. Called only when the
+# visualizer is active on a remote/streaming track, and only once per track
+# change — NOT on every status poll. Reads the resolved CDN URL the streaming
+# plugin (Qobuz, Bandcamp, etc.) stored on the current Song object. Returns it
+# as JSON so the page can fetch/analyse the actual audio. Local tracks and
+# sources that only expose an internal protocol URL return an empty url.
+# Same-origin stream proxy for CORS-blocked streaming services (Bandcamp, etc.).
+# The browser can't run Web Audio analysis on a cross-origin stream whose CDN
+# doesn't send CORS headers. So the page fetches the audio FROM US instead:
+# we fetch the resolved public CDN URL server-side and relay the bytes. Because
+# the browser talks to our own origin, CORS doesn't apply and the analyser can
+# read the samples.
+#
+# SAFETY: this only ever fetches the public URL passed in ?url= (which the
+# visualizer resolved). It never touches the player/song object, so it cannot
+# affect playback.
+#
+# This version relays a FINITE resource (a track file, e.g. Bandcamp). It is
+# NOT suitable for an endless live stream (e.g. Radio Paradise) — that needs a
+# true chunked relay, handled separately.
+sub _handleStreamProxy {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $url = $q{url} // '';
+
+    unless ($url =~ m{^https?://}i) {
+        $response->code(400);
+        _send($httpClient, $response, 'text/plain', 'bad url', no_cache => 1);
+        return;
+    }
+
+    Slim::Networking::SimpleAsyncHTTP->new(
+        sub {
+            my $http = shift;
+            my $ct   = $http->headers->content_type || 'application/octet-stream';
+            my $body = $http->content;
+            $response->code(200);
+            $response->header('Content-Type'   => $ct);
+            $response->header('Content-Length'  => length($body));
+            $response->header('Access-Control-Allow-Origin' => '*');
+            $response->header('Cache-Control'  => 'no-store');
+            $response->content($body);
+            Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$body);
+        },
+        sub {
+            my $http  = shift;
+            my $error = shift || 'fetch failed';
+            $log->warn("NowPlayingDisplay stream proxy failed: $error");
+            $response->code(502);
+            my $b = 'proxy fetch failed';
+            $response->header('Content-Type'  => 'text/plain');
+            $response->header('Content-Length' => length($b));
+            Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$b);
+        },
+        { timeout => 30 },
+    )->get($url);
+}
+
+sub _handleStreamUrl {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $playerId = $q{player} // '';
+    my $debug    = $q{debug};
+
+    my $client;
+    if ($playerId eq '' || lc($playerId) eq 'auto') {
+        $client = _autoActivePlayer();
+    } else {
+        $client = Slim::Player::Client::getClient($playerId);
+    }
+
+    my $url = '';
+    my $needsProxy = \0;   # JSON false; true for CORS-blocked sources
+    my %dbg;
+    if ($client) {
+        eval {
+            my $song = $client->playingSong;
+            $dbg{have_song} = $song ? 1 : 0;
+            if ($song) {
+                my $su = $song->streamUrl;
+                $dbg{stream_url_raw} = defined $su ? $su : '(undef)';
+                my $tr = eval { $song->track ? $song->track->url : '' };
+                $dbg{track_url_raw} = $tr // '';
+                eval {
+                    for my $k (qw(streamUrl url gapless_url)) {
+                        my $v = $song->pluginData($k);
+                        $dbg{"pluginData_$k"} = $v if defined $v && !ref $v;
+                    }
+                };
+                $url = $su if $su && $su =~ m{^https?://};
+
+                # Decide whether this source needs the same-origin proxy. This
+                # is by SOURCE PROTOCOL (deterministic) rather than runtime
+                # timing/error guessing. Qobuz's CDN allows CORS so it plays
+                # direct; Bandcamp and Radio Paradise are CORS-blocked and must
+                # go through our proxy. Default unknown remote sources to proxy
+                # (safer — works even if their CDN blocks CORS).
+                my $proto = ($tr && $tr =~ m{^([a-z0-9\+\-]+)://}i) ? lc($1) : '';
+                $dbg{source_proto} = $proto;
+                if ($proto eq 'qobuz') {
+                    $needsProxy = \0;          # direct works
+                } elsif ($proto) {
+                    $needsProxy = \1;          # bandcamp, radioparadise, others
+                }
+            }
+        };
+        $dbg{eval_error} = $@ if $@;
+    } else {
+        $dbg{have_client} = 0;
+    }
+
+    my $out = { url => $url, needsProxy => $needsProxy };
+    $out->{debug} = \%dbg if $debug;
+    _send($httpClient, $response, 'application/json',
+          encode_json($out), no_cache => 1);
+}
+
 sub _handleStateJson {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
@@ -341,6 +486,7 @@ sub _liveConfig {
             playerMap => $pmap,
             default   => $vizDefault + 0,
             smoothing => ($prefs->get('vizSmoothing') // 'medium'),
+            style     => ($prefs->get('vizStyle') // 'segmented'),
         },
     };
 }
@@ -707,6 +853,7 @@ sub _handlePage {
         playerMap => $pmap,
         default   => $vizDefault + 0,
         smoothing => ($prefs->get('vizSmoothing') // 'medium'),
+        style     => ($prefs->get('vizStyle') // 'segmented'),
     });
     $body =~ s/__NPD_DEFAULT_MODE__/$defaultMode/g;
     $body =~ s/__NPD_SCROLL_PX__/$scrollPx/g;
@@ -1610,9 +1757,10 @@ sub _pageHtml { return <<'HTML'; }
       <button id="viz-plus50" class="viz-tbtn" title="+50 ms">+50</button>
       <button id="viz-plus10" class="viz-tbtn" title="+10 ms">+10</button>
       <button id="viz-tsave" class="viz-tbtn viz-tsave">Save</button>
+      <button id="viz-tstyle" class="viz-tbtn viz-tstyle">Style</button>
       <div id="viz-tsaved" class="viz-tsaved" hidden>Saved</div>
     </div>
-    <audio id="viz-audio" crossorigin="anonymous" preload="auto" playsinline></audio>
+    <audio id="viz-audio" preload="auto" playsinline></audio>
   </section>
 
 <script>
@@ -1813,7 +1961,11 @@ sub _pageHtml { return <<'HTML'; }
   });
 
   // ----- State poll -----
+  let pollInFlight = false;
   async function poll() {
+    if (pollInFlight) return;   // don't stack concurrent status queries if a
+                                // poll is slow (e.g. during a stream transition)
+    pollInFlight = true;
     try {
       const r = await fetch(
         `${BASE}/plugins/NowPlayingDisplay/state.json?player=${encodeURIComponent(currentPlayer)}`,
@@ -1834,6 +1986,8 @@ sub _pageHtml { return <<'HTML'; }
       console.error('[npd] poll/apply failed:', e);
       lastPollError = (e && e.stack) ? e.stack : String(e);
       $('dot').classList.remove('live');
+    } finally {
+      pollInFlight = false;
     }
   }
 
@@ -1849,6 +2003,10 @@ sub _pageHtml { return <<'HTML'; }
       VIZ_CFG = cfg.viz;   // viz offset is read fresh each correction, so the
                            // new value takes effect within ~1 frame
       if (cfg.viz.smoothing) vizApplySmoothing(cfg.viz.smoothing);
+      if (cfg.viz.style && VIZ_STYLES.indexOf(cfg.viz.style) >= 0 && !vizStyleTouched) {
+        vizStyle = cfg.viz.style;
+        vizUpdateStyleLabel();
+      }
     }
   }
 
@@ -1862,8 +2020,9 @@ sub _pageHtml { return <<'HTML'; }
     document.body.classList.toggle('idle', idle);
     document.body.classList.toggle('has-track', !idle);
 
-    // Keep the visualizer's audio source slaved to the room player.
-    if (currentMode === 'visualizer') vizSync(d);
+    // Keep the visualizer's audio source slaved to the room player. Wrapped so
+    // any visualizer/stream error can NEVER break the main display update.
+    if (currentMode === 'visualizer') { try { vizSync(d); } catch(e){ console.warn('[npd viz] sync error', e); } }
 
     const title  = d.title  || (idle ? 'Nothing playing' : '');
     const artist = d.artist || '';
@@ -1874,6 +2033,20 @@ sub _pageHtml { return <<'HTML'; }
     let artUrl = '';
     if (d.artwork) {
       artUrl = d.artwork.startsWith('http') ? d.artwork : (BASE + d.artwork);
+    }
+    // Keep an <img> of the current art for the radial visualizer centre. Only
+    // reload when the URL actually changes.
+    if (artUrl !== vizArtUrl) {
+      vizArtUrl = artUrl;
+      if (artUrl) {
+        const im = new Image();
+        im.crossOrigin = 'anonymous';
+        im.onload = () => { vizArtImg = im; };
+        im.onerror = () => { vizArtImg = null; };
+        im.src = artUrl;
+      } else {
+        vizArtImg = null;
+      }
     }
     if (artUrl) {
       $('bg').style.backgroundImage = `url("${artUrl}")`;
@@ -2224,22 +2397,33 @@ sub _pageHtml { return <<'HTML'; }
   // for it is already running. Only caches non-empty results. Runs regardless
   // of the current display mode — by the time the user is looking at lyrics
   // for the next track, they're already there.
-  let prefetchInFlightUrl = '';
+  let prefetchInFlightKey = '';
   function prefetchNextLyrics(d) {
     if (!d) return;
     const url = d.next_track_url;
+    const nid = d.next_track_id;
     if (!url) return;                       // last track in queue
-    if (lyrCache.has(url)) return;          // already have it
-    if (prefetchInFlightUrl === url) return; // already fetching it
-    prefetchInFlightUrl = url;
-    fetchLyrics(url, d.next_track_id)
+    // Remote/streaming tracks (negative id) carry a rotating token in their URL
+    // that changes every poll, which defeats URL-based caching and would make
+    // us re-fetch lyrics (a musicartistinfo lookup that hits LMS and the
+    // streaming plugin) on EVERY poll. Skip prefetch for those — lyrics lookup
+    // by remote URL is unreliable anyway, and hammering it can contend with the
+    // streaming source's own metadata handling.
+    const isRemote = !(nid !== undefined && nid !== null && nid !== '' && /^\d+$/.test(String(nid)));
+    if (isRemote) return;
+    // Key the cache/in-flight guard on the STABLE track id, not the URL.
+    const key = String(nid);
+    if (lyrCache.has(url)) return;          // already have it (local urls are stable)
+    if (prefetchInFlightKey === key) return; // already fetching this track
+    prefetchInFlightKey = key;
+    fetchLyrics(url, nid)
       .then((result) => {
         const hasSynced = result && result.synced && result.lines && result.lines.length;
         const hasPlain  = result && result.html && result.html.trim();
         if (hasSynced || hasPlain) lyrCachePut(url, result);
       })
       .catch(() => { /* prefetch is best-effort; ignore failures */ })
-      .finally(() => { if (prefetchInFlightUrl === url) prefetchInFlightUrl = ''; });
+      .finally(() => { if (prefetchInFlightKey === key) prefetchInFlightKey = ''; });
   }
 
   function renderLyrics() {
@@ -2364,6 +2548,39 @@ sub _pageHtml { return <<'HTML'; }
     lyrActive: () => lyrActiveIndex,
     mode:      () => currentMode,
     player:    () => currentPlayer,
+    viz:       () => {
+      const el = document.getElementById('viz-audio');
+      let amax = null, asample = null;
+      try {
+        if (vizAnalyser && vizData) {
+          vizAnalyser.getFloatFrequencyData(vizData);
+          let m = -Infinity;
+          for (let i = 0; i < vizData.length; i++) if (isFinite(vizData[i]) && vizData[i] > m) m = vizData[i];
+          amax = m;
+          asample = Array.from(vizData.slice(0, 5));
+        }
+      } catch(e) { amax = 'err:' + e.message; }
+      return {
+        ctxState:    vizCtx ? vizCtx.state : '(no ctx)',
+        sampleRate:  vizCtx ? vizCtx.sampleRate : null,
+        hasAnalyser: !!vizAnalyser,
+        hasSource:   !!vizSource,
+        analyserMaxDb: amax,
+        analyserSample: asample,
+        el: el ? {
+          crossOrigin: el.crossOrigin,
+          src:         (el.src || '').slice(0, 70),
+          paused:      el.paused,
+          muted:       el.muted,
+          currentTime: el.currentTime,
+          readyState:  el.readyState,
+          error:       el.error ? el.error.code : null,
+        } : '(no element)',
+        active:      vizActive,
+        trackId:     vizTrackId,
+        streamUrl:   (vizStreamUrl || '').slice(0, 70),
+      };
+    },
     state:     () => ({
       mode:                currentMode,
       player:              currentPlayer,
@@ -2623,9 +2840,17 @@ sub _pageHtml { return <<'HTML'; }
   let vizAnalyser = null;   // AnalyserNode
   let vizSource = null;     // MediaElementSourceNode
   let vizData = null;       // Uint8Array of frequency bins
+  let vizWave = null;       // Float32Array of time-domain samples (oscilloscope)
+  let vizStyle = 'segmented';  // segmented | radial | scope
+  let vizStyleTouched = false; // true once user cycles style on-screen this session
+  let vizArtImg = null;        // <img> of current album art for the radial centre
+  let vizArtUrl = '';          // last loaded art URL (avoids reloading each poll)
   let vizRAF = 0;           // requestAnimationFrame handle
   let vizActive = false;
   let vizTrackId = null;    // track_id currently loaded into the audio el
+  let vizStreamUrl = '';    // resolved remote stream URL currently loaded (Qobuz etc.)
+  let vizRemoteTid = null;  // track_id of the remote track we last fetched a stream URL for
+  let vizStreamTimeout = 0; // detects continuous streams that never become playable
   let vizLastSeek = 0;      // perf.now() of last position correction
   let vizRoomPos = 0;       // room position (s) at last poll
   let vizRoomPosAt = 0;     // perf.now() when that position was sampled
@@ -2642,11 +2867,14 @@ sub _pageHtml { return <<'HTML'; }
     const el = vizAudio();
     vizSource = vizCtx.createMediaElementSource(el);
     vizAnalyser = vizCtx.createAnalyser();
-    vizAnalyser.fftSize = 2048;
+    vizAnalyser.fftSize = 8192;   // 4096 bins @ ~5.4Hz — enough resolution to
+                                  // separate the low bass bands (50/69/94Hz),
+                                  // which 2048 (21.5Hz/bin) smeared together
     vizAnalyser.smoothingTimeConstant = 0.0;  // we apply uniform per-bar ballistics
     vizAnalyser.minDecibels = -100;
     vizAnalyser.maxDecibels = 0;
     vizData = new Float32Array(vizAnalyser.frequencyBinCount);
+    vizWave = new Float32Array(vizAnalyser.fftSize);   // time-domain for scope
     // Route source -> analyser -> gain(0) -> destination. We need a path to the
     // destination because iOS Safari will otherwise BYPASS the Web Audio graph
     // and play the element straight to the speakers (the "it just plays the
@@ -2690,6 +2918,10 @@ sub _pageHtml { return <<'HTML'; }
     vizSizeCanvas();
     vizWireTuner();
     if (VIZ_CFG && VIZ_CFG.smoothing) vizApplySmoothing(VIZ_CFG.smoothing);
+    if (VIZ_CFG && VIZ_CFG.style && VIZ_STYLES.indexOf(VIZ_CFG.style) >= 0 && !vizStyleTouched) {
+      vizStyle = VIZ_CFG.style;
+    }
+    vizUpdateStyleLabel();
     vizShowTuner();
     if (lastSnap) vizSync(lastSnap);
     if (!vizRAF) vizRAF = requestAnimationFrame(vizDraw);
@@ -2707,6 +2939,7 @@ sub _pageHtml { return <<'HTML'; }
   function vizStop() {
     vizActive = false;
     if (vizRAF) { cancelAnimationFrame(vizRAF); vizRAF = 0; }
+    clearTimeout(vizStreamTimeout);
     const t = document.getElementById('viz-tuner');
     if (t) t.hidden = true;
     clearTimeout(vizTunerHideTimer);
@@ -2731,11 +2964,96 @@ sub _pageHtml { return <<'HTML'; }
 
     const isLocal = tid !== undefined && tid !== null && tid !== '' && /^\d+$/.test(String(tid));
     if (!isLocal) {
-      if (vizTrackId !== null) { try { el.pause(); } catch(e){} el.removeAttribute('src'); el.load(); vizTrackId = null; }
-      vizHint('Visualizer needs a local track');
+      // Remote/streaming track. The resolved CDN URL isn't in the poll payload
+      // (that would touch the live song object every 2.5s); we fetch it ONCE
+      // per track from the /streamurl endpoint. tid identifies the track (even
+      // for remote tracks it's a stable negative id), so we refetch only when
+      // it changes.
+      if (String(tid) !== String(vizRemoteTid)) {
+        vizRemoteTid = String(tid);
+        vizStreamUrl = '';
+        vizTrackId = null;
+        const pid = (lastSnap && lastSnap.player && lastSnap.player.id) || currentPlayer || 'auto';
+        vizHint('Resolving stream…');
+        fetch(`${BASE}/plugins/NowPlayingDisplay/streamurl?player=${encodeURIComponent(pid)}`)
+          .then(r => r.json())
+          .then(j => {
+            if (String(tid) !== String(vizRemoteTid)) return;  // track moved on
+            const su = (j && j.url) || '';
+            if (!su) { vizHint('Visualizer is only available for local library tracks'); return; }
+            vizStreamUrl = su;
+            const myTid = String(tid);
+            const needsProxy = !!(j && j.needsProxy);
+            // The server tells us, by source protocol, whether this stream is
+            // CORS-blocked and must go through our same-origin proxy. Qobuz
+            // plays direct (CORS-friendly); Bandcamp/RP use the proxy. This is
+            // deterministic — no runtime timing/error guessing.
+            const loadSrc = needsProxy
+              ? `${BASE}/plugins/NowPlayingDisplay/streamproxy?url=${encodeURIComponent(su)}`
+              : su;
+
+            const cleanup = () => {
+              el.removeEventListener('canplay', onReady);
+              el.removeEventListener('error', onError);
+            };
+            const onReady = () => {
+              if (String(tid) !== myTid) { cleanup(); return; }
+              clearTimeout(vizStreamTimeout);
+              cleanup();
+              if (vizRoomState) el.play().catch(()=>{});
+              vizHint('');
+            };
+            const onError = () => {
+              if (String(tid) !== myTid) { cleanup(); return; }
+              clearTimeout(vizStreamTimeout);
+              cleanup();
+              vizStreamUrl = '';
+              vizHint('This stream can\u2019t be visualized');
+            };
+
+            el.addEventListener('canplay', onReady);
+            el.addEventListener('error', onError);
+            // crossOrigin is needed ONLY for the genuinely cross-origin direct
+            // path (Qobuz CDN, which sends CORS headers). The proxy is
+            // same-origin, so we must NOT set it there — Safari would taint a
+            // same-origin element that has crossOrigin set. (Even though the
+            // proxy sends ACAO:*, clearing the attribute is the safe choice and
+            // matches the local-file handling.)
+            if (needsProxy) {
+              el.removeAttribute('crossorigin');
+            } else {
+              el.crossOrigin = 'anonymous';
+            }
+            el.src = loadSrc;
+            el.load();
+
+            // For proxied streams, a continuous live stream (RP "regular") never
+            // finishes buffering so canplay never fires — watchdog nudges toward
+            // the interactive/FLAC channel.
+            if (needsProxy) {
+              clearTimeout(vizStreamTimeout);
+              vizStreamTimeout = setTimeout(() => {
+                if (String(tid) === myTid && (!el.readyState || el.readyState < 2)) {
+                  cleanup();
+                  try { el.removeAttribute('src'); el.load(); } catch(e){}
+                  vizStreamUrl = '';
+                  vizHint('This continuous stream can\u2019t be visualized — try the interactive/FLAC version of the channel');
+                }
+              }, 8000);
+            }
+          })
+          .catch(() => { vizHint('Visualizer is only available for local library tracks'); });
+      }
+      // Mirror play/pause for an already-loaded stream.
+      if (vizStreamUrl) {
+        if (playing) { if (el.paused && el.readyState >= 2) el.play().catch(()=>{}); }
+        else { if (!el.paused) el.pause(); }
+      }
       vizRoomState = playing;
       return;
     }
+    // Local track — clear any remote-stream state.
+    if (vizStreamUrl || vizRemoteTid) { vizStreamUrl = ''; vizRemoteTid = null; clearTimeout(vizStreamTimeout); }
 
     // Work out whether something discontinuous happened to the room since the
     // last poll. If it was playing, we expect position to have advanced by
@@ -2758,6 +3076,12 @@ sub _pageHtml { return <<'HTML'; }
     // --- Track change: load the new file, anchor on canplay ---
     if (trackChanged) {
       vizTrackId = String(tid);
+      // Same-origin local file: do NOT set crossOrigin. Safari taints a
+      // same-origin media element that has crossOrigin set if the response
+      // lacks CORS headers (LMS's /music/ endpoint doesn't send them), which
+      // silences the analyser even though audio plays. Clearing it here also
+      // resets any value left over from a previous streaming track.
+      el.removeAttribute('crossorigin');
       el.src = `${BASE}/music/${vizTrackId}/download.mp3`;
       el.load();
       vizHint('');
@@ -2901,6 +3225,22 @@ sub _pageHtml { return <<'HTML'; }
     }
   }
 
+  const VIZ_STYLES = ['segmented', 'scope', 'starburst', 'bokeh'];
+  const VIZ_STYLE_NAMES = { segmented: 'Bars', scope: 'Scope', starburst: 'Starburst', bokeh: 'Bokeh' };
+  function vizUpdateStyleLabel() {
+    const b = document.getElementById('viz-tstyle');
+    if (b) b.textContent = VIZ_STYLE_NAMES[vizStyle] || 'Style';
+  }
+  function vizCycleStyle() {
+    vizStyleTouched = true;
+    const idx = VIZ_STYLES.indexOf(vizStyle);
+    vizStyle = VIZ_STYLES[(idx + 1) % VIZ_STYLES.length];
+    vizUpdateStyleLabel();
+    vizShowTuner();
+    // Persist the chosen style as the new default.
+    fetch(`${BASE}/plugins/NowPlayingDisplay/setstyle?style=${vizStyle}`).catch(()=>{});
+  }
+
   function vizSaveOffset() {
     if (vizTuneMs === null) return;
     fetch(`${BASE}/plugins/NowPlayingDisplay/setoffset?ms=${vizTuneMs}`)
@@ -2924,6 +3264,7 @@ sub _pageHtml { return <<'HTML'; }
     bind('viz-plus10',  () => vizNudge(10));
     bind('viz-plus50',  () => vizNudge(50));
     bind('viz-tsave',   vizSaveOffset);
+    bind('viz-tstyle',  vizCycleStyle);
     // Tap anywhere in the visualizer reveals the tuner.
     const sec = document.querySelector('.mode.visualizer');
     if (sec) sec.addEventListener('pointerdown', (e) => {
@@ -2936,6 +3277,7 @@ sub _pageHtml { return <<'HTML'; }
       if (e.key === 'ArrowLeft')  { vizNudge(e.shiftKey ? -50 : -10); e.preventDefault(); }
       else if (e.key === 'ArrowRight') { vizNudge(e.shiftKey ? 50 : 10); e.preventDefault(); }
       else if (e.key === 's' || e.key === 'S') { vizSaveOffset(); }
+      else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { vizCycleStyle(); e.preventDefault(); }
     });
   }
 
@@ -2943,8 +3285,15 @@ sub _pageHtml { return <<'HTML'; }
   // VIZ_DB_FLOOR = the dBFS that reads as zero height (silence/noise floor),
   // VIZ_DB_CEIL  = the dBFS that reads as full height (0 = full scale).
   // Per-band level is the energy sum of the band's bins converted back to dBFS.
-  const VIZ_DB_FLOOR = -75;
-  const VIZ_DB_CEIL  = -15;
+  const VIZ_DB_FLOOR = -73;   // lowered from -68: recover quiet/low-volume peaks
+                              // that the spectral tilt left under-reading, without
+                              // touching the bass/treble balance or the ceiling.
+  const VIZ_DB_CEIL  = -10;   // takes near-full-scale to fill a bar (unchanged)
+  // Per-octave tilt to counter music's bass-heavy roll-off, pivoting around
+  // VIZ_TILT_PIVOT_HZ: bands below it are cut, bands above are boosted, by this
+  // many dB per octave from the pivot. 0 = raw/untilted.
+  const VIZ_TILT_DB_PER_OCT = 3.0;
+  const VIZ_TILT_PIVOT_HZ   = 1000;   // ~geometric centre of 50Hz–20kHz
 
   // Uniform ballistics applied per DISPLAY bar (not per FFT bin), so every bar
   // — bass or treble — rises and falls with the same feel, like a real
@@ -2953,11 +3302,16 @@ sub _pageHtml { return <<'HTML'; }
   let vizPeaks  = null;            // peak-hold 0..1 per bar
   // Attack/decay are set from the 'smoothing' setting (applied live). Higher
   // = snappier; lower = calmer/more decay. Defaults to 'medium'.
-  let VIZ_ATTACK = 0.45;
-  let VIZ_DECAY  = 0.07;
-  const VIZ_PEAK_DECAY = 0.007;    // how fast the peak cap falls each frame (lower = hangs longer)
+  let VIZ_ATTACK = 0.55;
+  let VIZ_DECAY  = 0.15;
+  const VIZ_PEAK_DECAY = 0.003;    // per-60fps-frame cap drift; time-scaled so real fall speed is constant
   const VIZ_BARS  = 20;            // columns — matches Eversolo (50Hz–20kHz)
   const VIZ_CELLS = 26;            // segments per column (LED matrix rows)
+  // Spectrum colour sweep endpoints (HSL hue degrees): bass -> treble. Default
+  // warm red/orange bass sweeping to cool cyan/blue highs (roughly opposite on
+  // the colour wheel). Tune these to recolour the whole spectrum.
+  const VIZ_HUE_LOW  = 12;         // bass end (red/orange)
+  const VIZ_HUE_HIGH = 200;        // treble end (cyan/blue)
   // Exact Eversolo DMP-A8 band labels (log-spaced 50Hz–20kHz, ratio ~1.37).
   const VIZ_LABELS = ['50','69','94','129','176','241','331','453','620','850',
                       '1.2k','1.6k','2.2k','3.0k','4.1k','5.6k','7.7k','11k','14k','20k'];
@@ -2966,11 +3320,14 @@ sub _pageHtml { return <<'HTML'; }
   // lively. attack stays fairly quick so transients still register.
   function vizApplySmoothing(name) {
     switch (name) {
-      case 'lively':     VIZ_ATTACK = 0.60; VIZ_DECAY = 0.14; break;
-      case 'smooth':     VIZ_ATTACK = 0.40; VIZ_DECAY = 0.045; break;
-      case 'verysmooth': VIZ_ATTACK = 0.32; VIZ_DECAY = 0.025; break;
+      case 'lively':     VIZ_ATTACK = 0.70; VIZ_DECAY = 0.22; break;
+      case 'smooth':     VIZ_ATTACK = 0.45; VIZ_DECAY = 0.09; break;
+      case 'verysmooth': VIZ_ATTACK = 0.35; VIZ_DECAY = 0.05; break;
+      // 'medium' tuned to match the Eversolo: snappy attack, fairly quick decay
+      // so bars collapse promptly when signal drops (the slow element is the
+      // peak cap, not the bar).
       case 'medium':
-      default:           VIZ_ATTACK = 0.45; VIZ_DECAY = 0.07; break;
+      default:           VIZ_ATTACK = 0.55; VIZ_DECAY = 0.15; break;
     }
   }
 
@@ -2980,10 +3337,7 @@ sub _pageHtml { return <<'HTML'; }
     if (!vizG || !vizAnalyser) return;
 
     // If the AudioContext is still suspended (browsers start it that way until
-    // a user gesture), keep trying to resume every frame. Switching into this
-    // mode is usually itself a gesture, so this typically wakes within a frame
-    // or two; otherwise the first tap/keypair anywhere resumes it. Until then
-    // the analyser returns silence and the bars sit on the dim grid.
+    // a user gesture), keep trying to resume every frame.
     if (vizCtx && vizCtx.state === 'suspended') {
       vizResume();
       vizHint('Tap to start the visualizer');
@@ -2993,26 +3347,104 @@ sub _pageHtml { return <<'HTML'; }
 
     vizCorrect();   // keep audio position locked to room + offset
 
-    vizAnalyser.getFloatFrequencyData(vizData);   // values in dBFS (<=0)
     const W = vizCanvas.width, H = vizCanvas.height;
-
     vizG.clearRect(0, 0, W, H);
     vizG.fillStyle = '#000';
     vizG.fillRect(0, 0, W, H);
 
-    // Layout: leave a margin at the bottom for frequency labels.
+    // Dispatch to the active style. All styles share the same audio plumbing;
+    // they differ only in how they render the analysed data.
+    if (vizStyle === 'starburst')   vizDrawStarburst(W, H);
+    else if (vizStyle === 'bokeh')  vizDrawBokeh(W, H);
+    else if (vizStyle === 'scope')  vizDrawScope(W, H);
+    else                            vizDrawSegmented(W, H);
+  }
+
+  // Compute the per-bar 0..1 levels from the current FFT, applying ballistics
+  // and peak-hold. Shared by the bar-based styles (segmented + radial). Fills
+  // vizLevels[] and vizPeaks[] and returns the bar count.
+  // Update cadence. Drawing runs every animation frame (~60fps) for smooth
+  // motion, but the analysis/level update is throttled a little to a slightly
+  // calmer cadence than full 60fps. Crucially the ballistics below are now
+  // TIME-BASED (scaled by elapsed time), so the real-time rise/fall speed stays
+  // constant regardless of this cadence — changing the update rate no longer
+  // changes how fast bars fall.
+  let vizLastCompute = 0;
+  const VIZ_UPDATE_MS = 22;   // ~45 updates/sec
+  function vizComputeBands() {
+    const now = performance.now();
+    const dt = now - vizLastCompute;
+    if (dt < VIZ_UPDATE_MS && vizLevels) return VIZ_BARS;
+    vizLastCompute = now;
+    // Scale factor relative to a 60fps frame (16.7ms). Clamp so a long stall
+    // (e.g. tab backgrounded) can't produce a huge jump.
+    const fscale = Math.min(4, dt / 16.7);
+    vizAnalyser.getFloatFrequencyData(vizData);
     const bins   = vizData.length;
     const nyq    = (vizCtx ? vizCtx.sampleRate : 44100) / 2;
     const hzPer  = nyq / bins;
     const fMin   = 50;
     const fMax   = Math.min(20000, nyq);
     const bars   = VIZ_BARS;
-    const cells  = VIZ_CELLS;
     const logMin = Math.log10(fMin);
     const logMax = Math.log10(fMax);
     const span   = VIZ_DB_CEIL - VIZ_DB_FLOOR;
 
-    const labelH = Math.round(H * 0.06);          // bottom axis height
+    if (!vizLevels || vizLevels.length !== bars) vizLevels = new Float32Array(bars);
+    if (!vizPeaks  || vizPeaks.length  !== bars) vizPeaks  = new Float32Array(bars);
+
+    // Convert the per-frame attack/decay fractions into time-scaled rates.
+    // 1-(1-r)^fscale gives the equivalent fraction over `fscale` frames.
+    const aRate = 1 - Math.pow(1 - VIZ_ATTACK, fscale);
+    const dRate = 1 - Math.pow(1 - VIZ_DECAY,  fscale);
+    const peakDrop = VIZ_PEAK_DECAY * fscale;
+
+    for (let i = 0; i < bars; i++) {
+      const f0 = Math.pow(10, logMin + (i     / bars) * (logMax - logMin));
+      const f1 = Math.pow(10, logMin + ((i+1) / bars) * (logMax - logMin));
+      let b0 = Math.floor(f0 / hzPer);
+      let b1 = Math.max(b0 + 1, Math.ceil(f1 / hzPer));
+      if (b1 > bins) b1 = bins;
+      let power = 0, nb = 0;
+      for (let b = b0; b < b1; b++) {
+        const db = vizData[b];
+        if (db === -Infinity || isNaN(db)) continue;
+        power += Math.pow(10, db / 10);
+        nb++;
+      }
+      // Average power per bin (not sum). Summing would massively favour the
+      // wide treble bands (which span 50-240 bins) over the narrow bass bands
+      // (2-3 bins), making the high end read artificially boosted. Averaging
+      // gives each band its true level regardless of how many bins it spans.
+      const avgPower = nb > 0 ? power / nb : 0;
+      let bandDb = avgPower > 0 ? 10 * Math.log10(avgPower) : -Infinity;
+
+      // Spectral tilt, pivoting around the spectrum CENTRE so it both CUTS the
+      // bass and BOOSTS the treble (a bottom-anchored tilt only lifts highs and
+      // leaves the bass as high as before). Bands below centre are attenuated,
+      // bands above are lifted, by VIZ_TILT_DB_PER_OCT per octave from centre.
+      const fc = Math.sqrt(f0 * f1);                 // band centre (geometric)
+      const octFromCentre = Math.log2(fc / VIZ_TILT_PIVOT_HZ);
+      bandDb += VIZ_TILT_DB_PER_OCT * octFromCentre;
+
+      let target = (bandDb - VIZ_DB_FLOOR) / span;
+      if (!isFinite(target) || target < 0) target = 0;
+      if (target > 1) target = 1;
+      const cur = vizLevels[i];
+      const rate = (target > cur) ? aRate : dRate;
+      const v = cur + (target - cur) * rate;
+      vizLevels[i] = v;
+      if (v >= vizPeaks[i]) vizPeaks[i] = v;
+      else vizPeaks[i] = Math.max(v, vizPeaks[i] - peakDrop);
+    }
+    return bars;
+  }
+
+  // ----- Style 1: segmented LED spectrum (the Eversolo look) -----
+  function vizDrawSegmented(W, H) {
+    const bars  = vizComputeBands();
+    const cells = VIZ_CELLS;
+    const labelH = Math.round(H * 0.06);
     const padX   = Math.round(W * 0.02);
     const gridW  = W - padX * 2;
     const gridH  = H - labelH - Math.round(H * 0.03);
@@ -3023,77 +3455,267 @@ sub _pageHtml { return <<'HTML'; }
     const cellGapY = Math.max(2, Math.round((gridH / cells) * 0.22));
     const cellH  = (gridH / cells) - cellGapY;
 
-    if (!vizLevels || vizLevels.length !== bars) vizLevels = new Float32Array(bars);
-    if (!vizPeaks  || vizPeaks.length  !== bars) vizPeaks  = new Float32Array(bars);
-    const freqLabels = VIZ_LABELS;
-
     for (let i = 0; i < bars; i++) {
-      const f0 = Math.pow(10, logMin + (i     / bars) * (logMax - logMin));
-      const f1 = Math.pow(10, logMin + ((i+1) / bars) * (logMax - logMin));
-      let b0 = Math.floor(f0 / hzPer);
-      let b1 = Math.max(b0 + 1, Math.ceil(f1 / hzPer));
-      if (b1 > bins) b1 = bins;
-
-      // Band energy (sum power across bins) -> dBFS -> 0..1 against display range.
-      let power = 0;
-      for (let b = b0; b < b1; b++) {
-        const db = vizData[b];
-        if (db === -Infinity || isNaN(db)) continue;
-        power += Math.pow(10, db / 10);
-      }
-      const bandDb = power > 0 ? 10 * Math.log10(power) : -Infinity;
-      let target = (bandDb - VIZ_DB_FLOOR) / span;
-      if (!isFinite(target) || target < 0) target = 0;
-      if (target > 1) target = 1;
-
-      // Ballistics for the bar; peak-hold for the cap.
-      const cur = vizLevels[i];
-      const rate = (target > cur) ? VIZ_ATTACK : VIZ_DECAY;
-      const v = cur + (target - cur) * rate;
-      vizLevels[i] = v;
-      if (v >= vizPeaks[i]) vizPeaks[i] = v;
-      else vizPeaks[i] = Math.max(v, vizPeaks[i] - VIZ_PEAK_DECAY);
-
-      const hue = 8 + (i / (bars - 1)) * 300;     // red (bass) -> violet (highs)
+      const v = vizLevels[i];
+      // Sweep the base hue across the whole spectrum from VIZ_HUE_LOW (bass) to
+      // VIZ_HUE_HIGH (treble) — a clean two-colour gradient low->high.
+      const sweep = bars > 1 ? i / (bars - 1) : 0;
+      const baseHue = VIZ_HUE_LOW + sweep * (VIZ_HUE_HIGH - VIZ_HUE_LOW);
       const x = padX + i * colW + cellGapX / 2;
-
       const litCells = Math.round(v * cells);
-
-      // Draw the column: dim unlit grid cells + lit bar cells (no peak here).
       for (let c = 0; c < cells; c++) {
         const cy = gridTop + gridH - (c + 1) * (cellH + cellGapY) + cellGapY;
         if (c < litCells) {
-          const light = 44 + (c / cells) * 16;            // brighter higher up
-          vizG.fillStyle = `hsl(${hue}, 82%, ${light}%)`;
+          // Within-bar vertical gradient: cells near the base sit at the bar's
+          // base hue; cells higher up drift toward the OPPOSITE end of the
+          // spectrum sweep, and gain saturation + brightness — so each bar
+          // glows hotter and shifts colour as it climbs.
+          const t = litCells > 1 ? c / (litCells - 1) : 1;   // 0 base, 1 top
+          const hue   = baseHue + t * (VIZ_HUE_HIGH - VIZ_HUE_LOW) * 0.12;
+          const sat   = 70 + t * 25;                         // 70% -> 95%
+          const light = 40 + t * 26;                         // 40% -> 66%
+          vizG.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
         } else {
-          vizG.fillStyle = `hsla(${hue}, 40%, 50%, 0.10)`; // dim unlit cell
+          vizG.fillStyle = `hsla(${baseHue}, 40%, 50%, 0.10)`;
         }
         vizG.fillRect(x, cy, cellW, cellH);
       }
-
-      // Peak-hold cap: a distinct bright segment that FLOATS above the bar with
-      // a visible gap and falls slowly — like the Eversolo. Force it to sit at
-      // least one cell above the lit bar so it always reads as a separate cap.
       let peakCell = Math.round(vizPeaks[i] * cells);
       if (peakCell <= litCells && litCells < cells) peakCell = litCells + 1;
       peakCell = Math.min(cells - 1, peakCell);
       if (peakCell > 0) {
         const py = gridTop + gridH - (peakCell + 1) * (cellH + cellGapY) + cellGapY;
-        // White-hot cap with a faint glow for that LED look.
-        vizG.fillStyle = `hsl(${hue}, 100%, 88%)`;
+        vizG.fillStyle = `hsl(${baseHue}, 100%, 88%)`;
         vizG.fillRect(x, py, cellW, cellH);
       }
     }
 
-    // Frequency labels along the bottom.
     vizG.fillStyle = 'rgba(255,255,255,0.55)';
     vizG.font = `${Math.round(labelH * 0.5)}px system-ui, sans-serif`;
     vizG.textAlign = 'center';
     vizG.textBaseline = 'middle';
     for (let i = 0; i < bars; i++) {
       const cx = padX + i * colW + colW / 2;
-      vizG.fillText(freqLabels[i], cx, H - labelH / 2);
+      vizG.fillText(VIZ_LABELS[i], cx, H - labelH / 2);
     }
+  }
+
+  // ----- Style: bokeh particles -----
+  // Soft out-of-focus orbs drift across the screen; each orb is tied to a
+  // frequency band and pulses in size + brightness with that band's level.
+  // Warm->cool theme colours, gentle drift, glowing radial-gradient fill.
+  let vizBokeh = null;
+  const VIZ_BOKEH_COUNT = 80;
+  function vizBokehInit(W, H, bars) {
+    vizBokeh = [];
+    for (let i = 0; i < VIZ_BOKEH_COUNT; i++) {
+      vizBokeh.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        vx: (Math.random() - 0.5) * 0.25,   // slow drift
+        vy: (Math.random() - 0.5) * 0.25,
+        baseR: 22 + Math.random() * 110,    // wide size variety (sharp..very soft)
+        band: Math.floor(Math.random() * bars),
+        phase: Math.random() * Math.PI * 2, // for gentle independent shimmer
+        baseAlpha: 0.18 + Math.random() * 0.5,
+      });
+    }
+  }
+  function vizDrawBokeh(W, H) {
+    const bars = vizComputeBands();
+    if (!vizBokeh || vizBokeh._w !== W || vizBokeh._h !== H) {
+      vizBokehInit(W, H, bars);
+      vizBokeh._w = W; vizBokeh._h = H;
+    }
+    const span = (VIZ_HUE_HIGH - VIZ_HUE_LOW);
+    vizG.globalCompositeOperation = 'lighter';  // additive — overlaps glow brighter
+    for (const o of vizBokeh) {
+      // Drift, wrapping around the edges.
+      o.x += o.vx; o.y += o.vy; o.phase += 0.02;
+      const m = Math.max(o.baseR, 80);
+      if (o.x < -m) o.x = W + m; else if (o.x > W + m) o.x = -m;
+      if (o.y < -m) o.y = H + m; else if (o.y > H + m) o.y = -m;
+
+      const v = vizLevels[o.band % bars] || 0;
+      // Size and brightness pulse with the band level, plus a gentle shimmer.
+      const shimmer = 0.85 + 0.15 * Math.sin(o.phase);
+      const r = o.baseR * (0.7 + v * 0.9) * shimmer;
+      const sweep = (o.band / Math.max(1, bars - 1));
+      const hue = VIZ_HUE_LOW + sweep * span;
+      const alpha = o.baseAlpha * (0.35 + v * 0.9) * shimmer;
+
+      // Soft radial gradient: bright core fading to transparent — the bokeh glow.
+      const g = vizG.createRadialGradient(o.x, o.y, 0, o.x, o.y, r);
+      g.addColorStop(0,   `hsla(${hue}, 90%, 72%, ${Math.min(1, alpha)})`);
+      g.addColorStop(0.5, `hsla(${hue}, 85%, 60%, ${Math.min(1, alpha) * 0.4})`);
+      g.addColorStop(1,   `hsla(${hue}, 80%, 50%, 0)`);
+      vizG.fillStyle = g;
+      vizG.beginPath();
+      vizG.arc(o.x, o.y, r, 0, Math.PI * 2);
+      vizG.fill();
+    }
+    vizG.globalCompositeOperation = 'source-over';
+  }
+
+  // ----- Style: radial starburst -----
+  // Solid wedges radiate 360° from the centre, length driven by the band level.
+  // More wedges than bands (each band subdivided) for a finer bloom; the whole
+  // form rotates; per-wedge transparency slowly DRIFTS around the disc over time
+  // so different wedges fade in and out (not fixed, not flickering).
+  let vizBurstAngle = 0;
+  let vizBurstPhase = 0;
+  let vizBurstHue = 0;               // slow palette drift over time (0..1)
+  const VIZ_BURST_SUBDIV = 3;        // wedges per band (20 bands -> 60 wedges)
+  const VIZ_BURST_SPIN   = 0.022;    // rotation per update (higher = faster)
+  const VIZ_BURST_FADESPEED = 0.06;  // how fast the transparency pattern drifts
+  const VIZ_BURST_HUE_CYCLES = 3;    // times the colour gradient repeats around the disc
+  const VIZ_BURST_HUE_DRIFT  = 0.003;// slow palette shift per update
+  // Layer configs for the 3D/overlapping look. Each layer is the full burst at
+  // a different length scale, angular offset, rotation speed and opacity, drawn
+  // back-to-front so shorter/brighter wedges overlap longer/fainter ones —
+  // giving a sense of stacked planes and depth.
+  const VIZ_BURST_LAYERS = [
+    { scale: 1.00, offset: 0.0,  spin: 1.00, alpha: 0.55, sat: 60, lift: 30 }, // back: long, faint
+    { scale: 0.72, offset: 0.5,  spin: -0.6, alpha: 0.8,  sat: 75, lift: 44 }, // mid: offset, counter-rotates
+    { scale: 0.48, offset: 0.25, spin: 1.7,  alpha: 1.0,  sat: 92, lift: 56 }, // front: short, crisp, brightest
+  ];
+  function vizDrawStarburst(W, H) {
+    const bars = vizComputeBands();
+    const cx = W / 2, cy = H / 2;
+    const minDim = Math.min(W, H);
+    const baseR = minDim * 0.05;
+    const maxLen = minDim * 0.92;
+    const wedges = bars * VIZ_BURST_SUBDIV;
+    const slice = (Math.PI * 2) / wedges;
+
+    vizBurstAngle += VIZ_BURST_SPIN;
+    if (vizBurstAngle > Math.PI * 2) vizBurstAngle -= Math.PI * 2;
+    vizBurstPhase += VIZ_BURST_FADESPEED;
+    vizBurstHue = (vizBurstHue + VIZ_BURST_HUE_DRIFT) % 1;
+
+    const span = (VIZ_HUE_HIGH - VIZ_HUE_LOW);
+
+    // Draw each layer back-to-front.
+    for (let L = 0; L < VIZ_BURST_LAYERS.length; L++) {
+      const lay = VIZ_BURST_LAYERS[L];
+      vizG.save();
+      vizG.translate(cx, cy);
+      vizG.rotate(vizBurstAngle * lay.spin + lay.offset);
+
+      for (let w = 0; w < wedges; w++) {
+        const fb = (w / wedges) * bars;
+        const bi = Math.floor(fb);
+        const frac = fb - bi;
+        const v0 = vizLevels[bi % bars];
+        const v1 = vizLevels[(bi + 1) % bars];
+        const v = v0 + (v1 - v0) * frac;
+
+        const len = v * maxLen * lay.scale;   // from the very centre (no core)
+        const a0 = w * slice;
+        const a1 = a0 + slice * 0.82;
+
+        const cyc = ((w * VIZ_BURST_HUE_CYCLES / wedges) + vizBurstHue) % 1;
+        const hue = VIZ_HUE_LOW + cyc * span;
+
+        const waveA = Math.sin(w * 0.22 + vizBurstPhase);
+        const waveB = Math.sin(w * 0.09 - vizBurstPhase * 0.6);
+        const blend = (waveA * 0.6 + waveB * 0.4);
+        const wedgeAlpha = (0.18 + (blend * 0.5 + 0.5) * 0.82) * lay.alpha;
+
+        const mid = (a0 + a1) / 2;
+        const gx = Math.cos(mid) * len, gy = Math.sin(mid) * len;
+        const grad = vizG.createLinearGradient(0, 0, gx, gy);
+        grad.addColorStop(0, `hsl(${hue}, ${lay.sat}%, ${lay.lift * 0.7}%)`);
+        grad.addColorStop(1, `hsl(${hue + 18}, ${lay.sat + 8}%, ${lay.lift + 16 + v * 10}%)`);
+
+        vizG.globalAlpha = wedgeAlpha;
+        // Triangular spike: a single point at the exact centre, fanning out to a
+        // flat outer edge — so all wedges converge to one centrepoint with no
+        // circular hub.
+        vizG.beginPath();
+        vizG.moveTo(0, 0);
+        vizG.lineTo(Math.cos(a0) * len, Math.sin(a0) * len);
+        vizG.lineTo(Math.cos(a1) * len, Math.sin(a1) * len);
+        vizG.closePath();
+        vizG.fillStyle = grad;
+        vizG.shadowBlur = (6 + v * 18) * (L === VIZ_BURST_LAYERS.length - 1 ? 1 : 0.4);
+        vizG.shadowColor = `hsla(${hue + 12}, 100%, 70%, ${0.2 + v * 0.35})`;
+        vizG.fill();
+      }
+      vizG.globalAlpha = 1;
+      vizG.shadowBlur = 0;
+      vizG.restore();
+    }
+  }
+
+  // ----- Style 2: radial / circular spectrum (dormant, kept for reference) -----
+  // Bars radiate outward from a centre ring; album art (if any) sits in the
+  // middle. Bass starts at the top and sweeps clockwise around the circle.
+  function vizDrawRadial(W, H) {
+    const bars = vizComputeBands();
+    const cx = W / 2, cy = H / 2;
+    const minDim = Math.min(W, H);
+    const innerR = minDim * 0.16;          // ring radius (art sits inside)
+    const maxLen = minDim * 0.30;          // max bar length outward
+    const barW   = (2 * Math.PI * innerR) / bars * 0.6;
+
+    // Album art in the centre, if we have it.
+    if (vizArtImg && vizArtImg.complete && vizArtImg.naturalWidth) {
+      const d = innerR * 1.7;
+      vizG.save();
+      vizG.beginPath();
+      vizG.arc(cx, cy, innerR * 0.92, 0, Math.PI * 2);
+      vizG.closePath();
+      vizG.clip();
+      vizG.drawImage(vizArtImg, cx - d/2, cy - d/2, d, d);
+      vizG.restore();
+    }
+
+    vizG.lineWidth = Math.max(2, barW);
+    vizG.lineCap = 'round';
+    for (let i = 0; i < bars; i++) {
+      const v = vizLevels[i];
+      const ang = (i / bars) * Math.PI * 2 - Math.PI / 2;  // start at top
+      const r0 = innerR;
+      const r1 = innerR + v * maxLen;
+      const hue = 8 + (i / (bars - 1)) * 300;
+      vizG.strokeStyle = `hsl(${hue}, 85%, ${48 + v * 22}%)`;
+      vizG.beginPath();
+      vizG.moveTo(cx + Math.cos(ang) * r0, cy + Math.sin(ang) * r0);
+      vizG.lineTo(cx + Math.cos(ang) * r1, cy + Math.sin(ang) * r1);
+      vizG.stroke();
+      // Peak dot floating beyond the bar.
+      const pr = innerR + vizPeaks[i] * maxLen + barW * 0.4;
+      vizG.fillStyle = `hsl(${hue}, 100%, 85%)`;
+      vizG.beginPath();
+      vizG.arc(cx + Math.cos(ang) * pr, cy + Math.sin(ang) * pr, Math.max(1.5, barW * 0.32), 0, Math.PI * 2);
+      vizG.fill();
+    }
+  }
+
+  // ----- Style 3: oscilloscope waveform -----
+  // Draws the actual time-domain waveform as a flowing line. Uses a hue sweep
+  // along the x-axis for a bit of colour.
+  function vizDrawScope(W, H) {
+    if (!vizWave) return;
+    vizAnalyser.getFloatTimeDomainData(vizWave);
+    const n = vizWave.length;
+    const mid = H / 2;
+    const amp = H * 0.40;
+    vizG.lineWidth = Math.max(2, H * 0.004);
+    vizG.lineJoin = 'round';
+    // Draw in a few coloured segments across the width for a subtle gradient.
+    const step = Math.max(1, Math.floor(n / W));
+    vizG.beginPath();
+    let first = true;
+    for (let x = 0, i = 0; i < n; i += step, x++) {
+      const px = (i / (n - 1)) * W;
+      const py = mid + vizWave[i] * amp;
+      if (first) { vizG.moveTo(px, py); first = false; }
+      else vizG.lineTo(px, py);
+    }
+    vizG.strokeStyle = 'hsl(190, 90%, 60%)';
+    vizG.stroke();
   }
 
   // ----- Boot -----

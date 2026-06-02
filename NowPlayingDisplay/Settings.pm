@@ -27,7 +27,7 @@ sub prefs {
     # in handler() from the dynamic preset_name_N / assign_<id> fields. Listing
     # them here would make the parent handler try to save them from absent
     # pref_ fields and wipe our values.
-    return ($prefs, qw(defaultMode scrollSpeed enableVisualizer vizDelayMs vizSmoothing));
+    return ($prefs, qw(defaultMode scrollSpeed enableVisualizer vizDelayMs vizSmoothing vizStyle));
 }
 
 sub handler {

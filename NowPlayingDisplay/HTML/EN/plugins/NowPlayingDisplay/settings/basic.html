@@ -120,6 +120,16 @@
     </select>
   [% END %]
 
+  [% WRAPPER settingGroup title="PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE"
+                          desc="PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_DESC" %]
+    <select name="pref_vizStyle" id="vizStyle" class="stdedit">
+      <option [% prefs.vizStyle == "segmented" ? "selected" : "" %] value="segmented">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SEG" | string %]</option>
+      <option [% prefs.vizStyle == "scope"     ? "selected" : "" %] value="scope">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SCOPE" | string %]</option>
+      <option [% prefs.vizStyle == "starburst" ? "selected" : "" %] value="starburst">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_STAR" | string %]</option>
+      <option [% prefs.vizStyle == "bokeh"     ? "selected" : "" %] value="bokeh">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_BOKEH" | string %]</option>
+    </select>
+  [% END %]
+
 [% END %]
 
 <script>

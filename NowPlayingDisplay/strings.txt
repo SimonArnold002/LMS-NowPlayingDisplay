@@ -115,3 +115,24 @@ PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_SMOOTH
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_SMOOTH_VERY
 	EN	Very smooth (gentle, lingering)
 
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE
+	EN	Visualizer style
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_DESC
+	EN	The default visualizer style. You can also cycle styles live using the "Style" button in the on-screen tuner (tap the visualizer to reveal it), or the up/down arrow keys.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SEG
+	EN	Segmented bars (Eversolo-style LED spectrum)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RAD
+	EN	Radial (bars radiating from album art)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SCOPE
+	EN	Oscilloscope (waveform line)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_STAR
+	EN	Starburst (radial wedges from centre)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_BOKEH
+	EN	Bokeh (soft drifting orbs of light)
+
