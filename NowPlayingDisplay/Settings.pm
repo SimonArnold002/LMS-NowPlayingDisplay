@@ -9,6 +9,7 @@ use base qw(Slim::Web::Settings);
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
+use Slim::Utils::PluginManager;
 
 my $log   = logger('plugin.nowplayingdisplay');
 my $prefs = preferences('plugin.nowplayingdisplay');
@@ -22,12 +23,12 @@ sub page {
 }
 
 sub prefs {
-    # Note: vizPresets and vizPlayerMap are intentionally NOT listed here. They
-    # are not simple pref_<name> form fields — we parse and save them manually
-    # in handler() from the dynamic preset_name_N / assign_<id> fields. Listing
-    # them here would make the parent handler try to save them from absent
-    # pref_ fields and wipe our values.
-    return ($prefs, qw(defaultMode scrollSpeed enableVisualizer vizDelayMs vizSmoothing vizStyle));
+    # Note: vizPlayerOffsets is intentionally NOT listed here. It is not a
+    # simple pref_<name> form field — we parse and save it manually in
+    # handler() from the per-player offset_<id> fields. Listing it here would
+    # make the parent handler try to save it from absent pref_ fields and wipe
+    # our values.
+    return ($prefs, qw(defaultMode scrollSpeed enableVisualizer vizDelayMs vizSmoothing vizStyle vizServerMode vizBridgeUrl vizPlayerMac vizAutoFollow vizHelperEnabled vizSqueezeliteEnabled));
 }
 
 sub handler {
@@ -42,63 +43,69 @@ sub handler {
         return int($v);   # int() guarantees JSON encodes a number, not "string"
     };
 
-    # Legacy/global default offset.
+    # Global default offset (fallback for players with no per-player value).
     if (exists $params->{pref_vizDelayMs}) {
         $params->{pref_vizDelayMs} = $clampMs->($params->{pref_vizDelayMs});
     }
 
-    # On save, parse the dynamic preset rows and per-player assignments out of
-    # the form. We detect a submission by the presence of our own fields rather
-    # than relying on a specific save-flag name (which varies), so this fires on
-    # any POST that includes the preset editor.
+    # Fold any deprecated named-preset assignments into the flat per-player map
+    # before we render. Idempotent / no-op once done.
+    eval { Plugins::NowPlayingDisplay::Plugin::_migratePlayerOffsets(); };
+    $log->error("NowPlayingDisplay offset migration failed: $@") if $@;
+
+    # On save, parse the per-player offset fields (offset_<playerId>) out of the
+    # form and rebuild vizPlayerOffsets. We detect a submission by the presence
+    # of our own fields rather than a specific save-flag name. A blank field
+    # clears that player's per-player offset (it then falls back to the global
+    # default).
     my $submitted = 0;
     for my $k (keys %$params) {
-        if ($k =~ /^preset_name_\d+$/ || $k =~ /^assign_/) { $submitted = 1; last; }
+        if ($k =~ /^offset_/) { $submitted = 1; last; }
     }
     if ($submitted) {
         eval {
-            my @presets;
-            my %seen;
+            my %offs;
             for my $k (keys %$params) {
-                next unless $k =~ /^preset_name_(\d+)$/;
-                my $i = $1;
-                my $name = $params->{"preset_name_$i"};
-                $name =~ s/^\s+|\s+$//g if defined $name;
-                next if !defined $name || $name eq '';
-                next if $seen{$name}++;             # unique names
-                my $ms = $clampMs->($params->{"preset_ms_$i"});
-                push @presets, { name => $name, ms => $ms };
-            }
-            $prefs->set('vizPresets', \@presets);
-
-            my %pmap;
-            my %validName = map { $_->{name} => 1 } @presets;
-            for my $k (keys %$params) {
-                next unless $k =~ /^assign_(.+)$/;
+                next unless $k =~ /^offset_(.+)$/;
                 my $pid = $1;
-                my $sel = $params->{$k};
-                next if !defined $sel || $sel eq '' || !$validName{$sel};
-                $pmap{$pid} = $sel;
+                my $raw = $params->{$k};
+                next if !defined $raw || $raw =~ /^\s*$/;   # blank = no per-player offset
+                $offs{$pid} = $clampMs->($raw);
             }
-            $prefs->set('vizPlayerMap', \%pmap);
+            $prefs->set('vizPlayerOffsets', \%offs);
         };
-        $log->error("NowPlayingDisplay preset save failed: $@") if $@;
+        $log->error("NowPlayingDisplay offset save failed: $@") if $@;
     }
 
-    # Build data for the template: players (with current assignment) + presets.
-    my $pmap    = $prefs->get('vizPlayerMap') || {};
-    my $presets = $prefs->get('vizPresets')   || [];
+    # Build data for the template: players with their current per-player offset.
+    # The dedicated Visualizer SqueezeLite is infrastructure (it's the capture
+    # player doing the FFT analysis, not a room), so it's never listed here and
+    # never gets an offset of its own.
+    my $offs = $prefs->get('vizPlayerOffsets') || {};
+    $offs = {} unless ref($offs) eq 'HASH';
+    my $vizMac = lc($prefs->get('vizPlayerMac') // '');
     my @players;
     for my $c (Slim::Player::Client::clients()) {
+        next if $vizMac && lc($c->id // '') eq $vizMac;
         push @players, {
-            name     => $c->name,
-            id       => $c->id,
-            assigned => $pmap->{$c->id} // '',
+            name   => $c->name,
+            id     => $c->id,
+            offset => (defined $offs->{$c->id} ? $offs->{$c->id} : ''),
         };
     }
     @players = sort { lc($a->{name}) cmp lc($b->{name}) } @players;
-    $params->{players}    = \@players;
-    $params->{vizPresets} = $presets;
+    $params->{players} = \@players;
+
+    # Helper status snapshot + relevant filesystem paths for the new server-side
+    # visualizer setup section. The template uses these to show running state,
+    # dep status, and copy-pasteable systemd setup instructions with the
+    # correct plugin install path for this machine.
+    $params->{helperStatus} = Plugins::NowPlayingDisplay::Plugin::_helperStatus();
+    $params->{sqzStatus}    = Plugins::NowPlayingDisplay::Plugin::_sqzStatus();
+    my $basedir = eval {
+        Slim::Utils::PluginManager->allPlugins->{'NowPlayingDisplay'}->{'basedir'}
+    } || '/var/lib/squeezeboxserver/cache/InstalledPlugins/Plugins/NowPlayingDisplay';
+    $params->{pluginBaseDir} = $basedir;
 
     return $class->SUPER::handler($client, $params);
 }

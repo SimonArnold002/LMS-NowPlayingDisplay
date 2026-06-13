@@ -5,9 +5,9 @@
     <minVersion>8.0</minVersion>
     <maxVersion>*</maxVersion>
   </targetApplication>
-  <creator>You</creator>
-  <email>you@example.com</email>
-  <version>0.24.2.0</version>
+  <creator>CrystalGipsy</creator>
+  <email>crystalgipsy@users.noreply.github.com</email>
+  <version>0.37.9.0</version>
   <name>PLUGIN_NOWPLAYINGDISPLAY</name>
   <description>PLUGIN_NOWPLAYINGDISPLAY_DESC</description>
   <module>Plugins::NowPlayingDisplay::Plugin</module>

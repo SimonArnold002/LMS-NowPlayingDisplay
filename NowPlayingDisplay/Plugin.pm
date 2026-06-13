@@ -2,17 +2,31 @@ package Plugins::NowPlayingDisplay::Plugin;
 
 # NowPlaying — a standalone now-playing display page for LMS.
 #
-# This is a strictly read-only plugin:
-#   - No event subscriptions (no callback storms)
-#   - No forking (no runaway processes)
-#   - No external binaries (no platform issues)
-#   - HTTP endpoints, all idempotent:
-#       /plugins/NowPlayingDisplay/page             -> display HTML
-#       /plugins/NowPlayingDisplay/state.json       -> per-player snapshot
-#       /plugins/NowPlayingDisplay/players.json     -> list of players for the dropdown
-#       /plugins/NowPlayingDisplay/biography.json   -> artist biography via MAI
+# Read-only by default — no callbacks, no playback state changes from the
+# browser-audio path. The OPTIONAL server-side visualizer feature does add:
+#   - An auto-follow loop that mirrors the active room onto a dedicated
+#     headless SqueezeLite instance (the "Visualizer" player) so the
+#     server can analyse the audio. All commands gated by _isVizPlayer
+#     so it can only ever touch that specific MAC — _vizFindVisualizer
+#     is the chokepoint.
+#   - A bundled Python FFT helper (Bin/npd-vizfft.py) supervised by the
+#     plugin: spawned when server mode is enabled, restarted on death,
+#     stopped cleanly on plugin shutdown.
+# Both are off by default; with vizServerMode = 0 the plugin behaves as
+# the original strictly-read-only display.
 #
-# If anything in here goes wrong, it can only break itself, not LMS.
+# HTTP endpoints, all idempotent except the ones marked (*):
+#   /plugins/NowPlayingDisplay/page             -> display HTML
+#   /plugins/NowPlayingDisplay/state.json       -> per-player snapshot
+#   /plugins/NowPlayingDisplay/players.json     -> list of players for the dropdown
+#   /plugins/NowPlayingDisplay/biography.json   -> artist biography via MAI
+#   /plugins/NowPlayingDisplay/lyrics.json      -> synced lyrics via MAI
+#   /plugins/NowPlayingDisplay/streamurl        -> CDN URL + signature for streaming
+#   /plugins/NowPlayingDisplay/streamproxy      -> HMAC-gated CORS proxy
+#   /plugins/NowPlayingDisplay/setoffset    (*) -> save visualizer sync offset
+#   /plugins/NowPlayingDisplay/setstyle     (*) -> save visualizer style
+#   /plugins/NowPlayingDisplay/helper       (*) -> start/stop/restart/status/log
+#                                                  for the bundled FFT helper
 
 use strict;
 use warnings;
@@ -22,10 +36,18 @@ use JSON::XS;
 use Slim::Utils::Log;
 use Slim::Utils::Strings qw(string);
 use Slim::Utils::Prefs;
+use Slim::Utils::PluginManager;
+use Slim::Utils::OSDetect;
+use Slim::Utils::Network;
+use Slim::Utils::Misc;
 use Slim::Web::Pages;
 use Slim::Web::HTTP;
 use Slim::Control::Request;
 use Slim::Networking::SimpleAsyncHTTP;
+use Slim::Utils::Timers;
+use Time::HiRes ();
+use File::Spec::Functions qw(catdir catfile);
+use POSIX qw(setsid _exit);
 
 my $log = Slim::Utils::Log->addLogCategory({
     category     => 'plugin.nowplayingdisplay',
@@ -37,17 +59,1197 @@ my $log = Slim::Utils::Log->addLogCategory({
 # The settings page module (Settings.pm) reads and writes these.
 my $prefs = preferences('plugin.nowplayingdisplay');
 $prefs->init({
-    defaultMode    => 'now-playing',
-    scrollSpeed    => 'medium',     # low | medium | high
-    enableVisualizer => 0,          # opt-in: stream muted audio to react to it
-    vizDelayMs     => 80,           # visualizer sync offset, signed ms
-    vizSmoothing   => 'medium',     # meter responsiveness: lively|medium|smooth|verysmooth
-    vizStyle       => 'segmented',  # visualizer style: segmented|radial|scope
+    defaultMode      => 'now-playing',
+    scrollSpeed      => 'medium',              # low | medium | high
+    enableVisualizer => 1,                     # on by default; settings can turn it off
+    vizDelayMs       => 80,                    # visualizer sync offset, signed ms
+    vizSmoothing     => 'medium',              # meter responsiveness: lively|medium|smooth|verysmooth
+    vizStyle         => 'segmented',           # validated set: segmented, scope, ring,
+                                               #   ringVivid, ringZoom, ringClassic,
+                                               #   starburst, bokeh (see _handleSetStyle)
+    vizServerMode    => 0,                     # off by default; server-side FFT helper
+    vizBridgeUrl     => '',                    # ws://host:port/ of the helper when on
+    vizPlayerOffsets => {},                    # { playerId => ms } — per-player sync offset,
+                                               #   set directly from the on-screen Save button
+    vizPresets       => [],                    # DEPRECATED (named presets) — kept only so the
+    vizPlayerMap     => {},                    #   one-time migration in _migratePlayerOffsets
+                                               #   can fold old assignments into vizPlayerOffsets
+    vizPlayerMac     => '38:f7:cd:c5:1a:2c',   # dedicated Visualizer SqueezeLite — the
+                                               #   safety chokepoint for server-mode commands
+    vizHelperEnabled => 1,                     # auto-start bundled FFT helper when server
+                                               #   mode is on. Off only if user runs it
+                                               #   externally as a service themselves.
+    vizSqueezeliteEnabled => 1,                # auto-start dedicated Visualizer SqueezeLite
+                                               #   alongside the helper. Off if user runs it
+                                               #   externally (e.g. a separate systemd unit).
+    vizAutoFollow    => 1,                      # mirror the active/selected room onto the
+                                               #   Visualizer player (the current model). Turn
+                                               #   OFF to test native LMS sync grouping — when
+                                               #   off the plugin issues no playlist/seek
+                                               #   commands to the Visualizer, so you can sync
+                                               #   it into a room's group without the mirror
+                                               #   clobbering the shared queue. Player+helper
+                                               #   keep running (capture still works).
 });
+
+# ----------------------------------------------------------------------------
+# Bundled FFT helper supervisor
+# ----------------------------------------------------------------------------
+#
+# The plugin can spawn and supervise the Python FFT helper that backs the
+# server-side visualizer. Lifecycle is:
+#   * initPlugin             -> start a 5s supervisor timer if server mode is on
+#   * supervisor tick (5s)   -> if helper not running and should be, restart it
+#   * pref change            -> the timer's check on next tick reconciles
+#   * shutdownPlugin         -> SIGTERM the helper, wait briefly, SIGKILL
+#
+# A pidfile under /tmp/ tracks the running PID across plugin reloads (LMS can
+# reload plugins without a server restart). On startup we read the pidfile and
+# check if a previous instance is still alive; if so we adopt it; if not, we
+# spawn fresh. Avoids double-starts and orphaned helpers.
+
+my $HELPER_PID_FILE = '/tmp/nowplayingdisplay-helper.pid';
+my $HELPER_LOG_FILE = '/tmp/nowplayingdisplay-helper.log';
+# File the plugin writes the active offset (ms) to. Helper polls this file
+# every 100ms and uses it to position the FFT read window in its Python-side
+# ring buffer. Writing the file is the ONLY way to change the visualiser's
+# sync offset in server mode — JS-side buffering has been removed.
+my $HELPER_OFFSET_FILE = '/tmp/nowplayingdisplay-offset.txt';
+my $HELPER_LOG_MAX_BYTES = 1024 * 1024;        # rotate at 1MB
+# Cheap pidfile-check supervisor cadence. 15 s is plenty for "respawn if my
+# child died unexpectedly" semantics — we're not chasing real-time correctness.
+# Keeping this longer reduces our event-loop footprint, which matters because
+# LMS is single-threaded and other plugins' supervisors share the same loop.
+my $HELPER_SUPERVISE_SECS = 15;
+
+# Capture the LMS process PID at module load. Any later call to our subs that
+# comes from a process with a DIFFERENT PID is a forked-but-not-exec'd child
+# that's somehow still running our Perl code. That should never happen with
+# the hardened spawn paths in _helperStart/_sqzStart, but it's the bug that
+# caused multiple "squeezeboxserver" processes to appear and we want it to be
+# self-defending against any future regression. _checkNotClone() short-circuits
+# everything in a clone child so it can't multiply LMS resources further.
+my $LMS_OWNER_PID = $$;
+sub _isClone { return $$ != $LMS_OWNER_PID; }
+sub _checkNotClone {
+    return 0 unless _isClone();
+    # We're in a clone child that escaped exec(). Get out NOW. No log call —
+    # the log handle may be shared with the parent and writes could confuse
+    # the parent's log state.
+    POSIX::_exit(99);
+}
+
+# Check whether a single PID's cmdline matches a regex. ONE file open, no
+# /proc directory walk — different from the orphan-hunting _findProcsByCmdline
+# which is expensive. This is cheap enough to call from every pidfile read.
+sub _pidCmdlineMatches {
+    my ($pid, $re) = @_;
+    return 0 unless $pid && $pid =~ /^\d+$/;
+    my $cmdline = '';
+    if (open my $fh, '<', "/proc/$pid/cmdline") {
+        local $/ = undef;
+        $cmdline = <$fh>;
+        close $fh;
+    }
+    return 0 unless $cmdline;
+    $cmdline =~ tr/\0/ /;
+    return $cmdline =~ /$re/ ? 1 : 0;
+}
+
+# Path to our bundled Python helper. Uses the canonical LMS pattern (same as
+# UPnPBridge etc): resolve via Slim::Utils::PluginManager + decodeExternalHelperPath
+# so cross-platform paths work and the user never has to configure this.
+sub _helperScriptPath {
+    my $basedir = eval {
+        Slim::Utils::PluginManager->allPlugins->{'NowPlayingDisplay'}->{'basedir'}
+    };
+    return undef unless $basedir;
+    my $script = catfile($basedir, 'Bin', 'npd-vizfft.py');
+    return Slim::Utils::OSDetect::getOS->decodeExternalHelperPath($script);
+}
+
+# Derive listen port from vizBridgeUrl (ws://host:port/). If unparseable,
+# default to 8770 — matches the documented default in CLAUDE.md and the
+# settings-page placeholder.
+sub _helperPort {
+    my $url = $prefs->get('vizBridgeUrl') // '';
+    return $1 if $url =~ m{://[^:/]+:(\d+)};
+    return 8770;
+}
+
+# Read PID from pidfile if present and the process is still alive. Returns
+# the PID or undef. "Alive" check is kill(0, $pid) — works for any user since
+# we only ever spawn as ourselves.
+sub _helperReadPid {
+    return undef unless -r $HELPER_PID_FILE;
+    open my $fh, '<', $HELPER_PID_FILE or return undef;
+    my $pid = <$fh>;
+    close $fh;
+    return undef unless defined $pid;
+    chomp $pid;
+    return undef unless $pid =~ /^\d+$/;
+    # kill(0) alone returns true for ANY process with that PID, so if our
+    # original child died and the OS recycled the PID to something else,
+    # we'd incorrectly think the helper is running. Verify the cmdline
+    # actually looks like our helper.
+    return undef unless kill(0, $pid);
+    return _pidCmdlineMatches($pid, qr/npd-vizfft\.py/) ? $pid : undef;
+}
+
+sub _helperWritePid {
+    my ($pid) = @_;
+    open my $fh, '>', $HELPER_PID_FILE or return;
+    print $fh "$pid\n";
+    close $fh;
+}
+
+sub _helperClearPid {
+    unlink $HELPER_PID_FILE if -e $HELPER_PID_FILE;
+}
+
+# Rotate the log if it's grown past the cap. Cheap stat check on every spawn
+# (we don't care about within-run growth — just keep size bounded).
+sub _helperMaybeRotateLog {
+    return unless -e $HELPER_LOG_FILE;
+    my $sz = -s $HELPER_LOG_FILE // 0;
+    return if $sz < $HELPER_LOG_MAX_BYTES;
+    rename $HELPER_LOG_FILE, "$HELPER_LOG_FILE.old";
+}
+
+# Write the current effective offset (ms) to the file the FFT helper polls.
+# The plugin calls this whenever the offset changes:
+#   - user nudges via the tuner buttons (transient)
+#   - user saves a preset (persistent)
+#   - auto-follow picks a different active room (per-room preset applies)
+#   - plugin first starts the helper (initial value)
+# Returns the value that was written, or undef on I/O failure.
+sub _writeOffsetFile {
+    my ($ms) = @_;
+    return undef unless defined $ms;
+    $ms = int($ms);
+    $ms = 0 if $ms < 0;        # negative offsets are physically impossible
+                               # in the shmem-readback model; clamp silently.
+    $ms = 4500 if $ms > 4500;  # match helper's --max-offset-ms default
+    open my $fh, '>', $HELPER_OFFSET_FILE or do {
+        $log->warn("[helper] could not write offset file $HELPER_OFFSET_FILE: $!");
+        return undef;
+    };
+    print $fh "$ms\n";
+    close $fh;
+    return $ms;
+}
+
+# Compute the offset that applies to a given player ID:
+#   1. If the player has its own saved offset in vizPlayerOffsets, use it.
+#   2. Otherwise fall back to vizDelayMs (the global default).
+# Returns the ms value (or 0 if nothing resolves).
+sub _resolveOffsetForPlayer {
+    my ($playerId) = @_;
+    my $offs = $prefs->get('vizPlayerOffsets') || {};
+    if (ref($offs) eq 'HASH' && $playerId && defined $offs->{$playerId}
+            && $offs->{$playerId} =~ /^-?\d+$/) {
+        return int($offs->{$playerId});
+    }
+    return int($prefs->get('vizDelayMs') // 0);
+}
+
+# One-time migration from the deprecated named-preset model
+# (vizPresets + vizPlayerMap) to the flat per-player map (vizPlayerOffsets).
+# Idempotent: runs only while vizPlayerOffsets is empty and there's old data
+# to fold in. Each previously-assigned player gets its resolved preset ms
+# copied straight into vizPlayerOffsets, then the legacy prefs are cleared so
+# the settings page no longer shows the old editor.
+sub _migratePlayerOffsets {
+    my $offs = $prefs->get('vizPlayerOffsets');
+    return if ref($offs) eq 'HASH' && keys %$offs;   # already populated
+
+    my $presets = $prefs->get('vizPresets')   || [];
+    my $pmap    = $prefs->get('vizPlayerMap') || {};
+    return unless ref($pmap) eq 'HASH' && keys %$pmap;
+
+    my %byName;
+    if (ref($presets) eq 'ARRAY') {
+        for my $p (@$presets) {
+            next unless ref($p) eq 'HASH' && defined $p->{name};
+            $byName{$p->{name}} = int($p->{ms} // 0);
+        }
+    }
+    my %new;
+    for my $pid (keys %$pmap) {
+        my $name = $pmap->{$pid};
+        next unless defined $name && exists $byName{$name};
+        $new{$pid} = $byName{$name};
+    }
+    return unless keys %new;
+
+    $prefs->set('vizPlayerOffsets', \%new);
+    $prefs->set('vizPresets',   []);
+    $prefs->set('vizPlayerMap', {});
+    $log->info('[viz] migrated ' . scalar(keys %new)
+        . ' per-player offsets from deprecated presets');
+}
+
+# Check whether the system has python3 + numpy available. Cached so we don't
+# fork python every supervise tick — invalidate after explicit refresh.
+my $_helperDepsOk;
+my $_helperDepsErr;
+sub _helperDepsCheck {
+    my ($force) = @_;
+    return ($_helperDepsOk, $_helperDepsErr) if defined $_helperDepsOk && !$force;
+
+    my $py = _helperPythonBin();
+    if (!$py) {
+        $_helperDepsOk  = 0;
+        $_helperDepsErr = 'python3 not found in PATH';
+        return ($_helperDepsOk, $_helperDepsErr);
+    }
+    # Try importing numpy. Suppress all output, just look at exit code.
+    my $rc = system("$py -c 'import numpy' >/dev/null 2>&1");
+    if ($rc != 0) {
+        $_helperDepsOk  = 0;
+        $_helperDepsErr = 'python3 found, but numpy module is missing (install python3-numpy)';
+        return ($_helperDepsOk, $_helperDepsErr);
+    }
+    $_helperDepsOk  = 1;
+    $_helperDepsErr = '';
+    return ($_helperDepsOk, $_helperDepsErr);
+}
+
+# Find python3. Prefer python3, fall back to python (which on most modern
+# distros is also Python 3 anyway).
+sub _helperPythonBin {
+    for my $cand (qw(python3 python)) {
+        my $rc = system("which $cand >/dev/null 2>&1");
+        return $cand if $rc == 0;
+    }
+    return undef;
+}
+
+# Spawn the helper. Returns the PID on success, undef on failure. The child
+# is detached (setsid + new file descriptors) so it survives a plugin reload
+# of the parent.
+sub _helperStart {
+    my $existing = _helperReadPid();
+    if ($existing) {
+        $log->info("[helper] already running (PID $existing); not starting another");
+        return $existing;
+    }
+
+    my ($depsOk, $depsErr) = _helperDepsCheck();
+    if (!$depsOk) {
+        $log->warn("[helper] dependency check failed: $depsErr — not starting");
+        return undef;
+    }
+
+    my $script = _helperScriptPath();
+    if (!$script || !-r $script) {
+        $log->error("[helper] script not found at expected path: " . ($script // '(undef)'));
+        return undef;
+    }
+
+    my $py = _helperPythonBin();
+    my $mac = $prefs->get('vizPlayerMac') // '';
+    if (!$mac) {
+        $log->warn("[helper] vizPlayerMac is empty — cannot determine shmem path");
+        return undef;
+    }
+    my $port = _helperPort();
+
+    # Shmem path the helper reads from. SqueezeLite writes here when started
+    # with -v and -m <mac>.
+    my $shmem = "/squeezelite-$mac";
+
+    # Like _sqzStart: NO /proc scan here. Cleanup is via the explicit endpoint.
+
+    _helperMaybeRotateLog();
+
+    # Make sure the offset file exists with the default-offset value before we
+    # spawn the helper, so its very first FFT frame uses the right shift
+    # rather than 0. The helper's _refresh_offset() will read this in its
+    # first iteration of the producer loop.
+    my $initialOffset = int($prefs->get('vizDelayMs') // 0);
+    _writeOffsetFile($initialOffset);
+
+    my $pid = fork();
+    if (!defined $pid) {
+        $log->error("[helper] fork failed: $!");
+        return undef;
+    }
+    if ($pid == 0) {
+        # ====== CHILD PROCESS ======
+        # CRITICAL: the child has inherited every open file descriptor from
+        # LMS, including the listening sockets on ports 3483/9090/9000. If
+        # exec() fails OR returns OR is somehow bypassed, the child must die
+        # IMMEDIATELY — it must NEVER fall back through into Perl/LMS code,
+        # because then we'd have two "squeezeboxserver" processes running on
+        # the same listening sockets, both running every plugin's init, and
+        # the bridge plugins each see they're being shadowed and spawn
+        # replacements. Down that path is the "3x squeezeboxserver + 3x of
+        # every plugin's helper" mess.
+        #
+        # Defence layers (any one will save us):
+        #  1. POSIX::close every fd above stdio before exec
+        #  2. Use POSIX::_exit (the raw _exit(2) syscall) on failure paths,
+        #     not Perl's exit — Perl's exit runs END blocks and DESTROYs that
+        #     can hang the child against LMS-owned resources
+        #  3. Wrap exec in eval AND check return AND have a guaranteed _exit
+        #     after the eval block
+        eval { setsid(); };
+
+        # Close every inherited FD above stderr. This kicks the child off the
+        # LMS listening sockets so even if it somehow keeps running, it's not
+        # accepting LMS traffic. /proc/self/fd is more reliable than guessing
+        # a max FD number.
+        if (opendir(my $fdh, '/proc/self/fd')) {
+            while (my $f = readdir $fdh) {
+                next unless $f =~ /^\d+$/;
+                next if $f < 3;     # keep stdin/stdout/stderr for now; we re-open below
+                POSIX::close($f + 0);
+            }
+            closedir $fdh;
+        }
+
+        # Now safely re-open stdio to our log file (the old FDs were closed by
+        # the loop above if they pointed anywhere meaningful).
+        # CRITICAL: untie STDIN/STDOUT/STDERR before redirecting them. LMS
+        # ties these to Slim::Utils::Log::Trapper so plugin output flows into
+        # LMS's log files. The Trapper class doesn't implement the OPEN tie
+        # method, so `open STDOUT, '>>', $logfile` dies with "Can't locate
+        # object method OPEN via package Slim::Utils::Log::Trapper". That
+        # kills the child BEFORE we reach exec — squeezelite/python never
+        # start, the pidfile we wrote in the parent retains a dead PID, and
+        # the status endpoint lies about "running" because kill(0,$pid)
+        # eventually matches recycled OS PIDs. Untie removes the tie object
+        # so plain open works again.
+        untie *STDIN  if tied *STDIN;
+        untie *STDOUT if tied *STDOUT;
+        untie *STDERR if tied *STDERR;
+
+        open STDIN,  '<',  '/dev/null';
+        open STDOUT, '>>', $HELPER_LOG_FILE;
+        open STDERR, '>&', \*STDOUT;
+        select STDERR; $| = 1;
+        select STDOUT; $| = 1;
+        print STDOUT "\n=== helper start " . scalar(localtime()) . " (pid $$) ===\n";
+
+        # Exec. On success, control never returns. On failure, fall through to
+        # the guaranteed _exit below.
+        { exec { $py } $py, $script, '--shmem', $shmem, '--port', $port,
+                                     '--offset-file', $HELPER_OFFSET_FILE; }
+        print STDERR "[helper] exec($py $script ...) failed: $!\n";
+        POSIX::_exit(127);
+        # Belt and braces — should be unreachable.
+        CORE::exit(127);
+    }
+
+    _helperWritePid($pid);
+    $log->info("[helper] spawned PID $pid ($py $script --shmem $shmem --port $port --offset-file $HELPER_OFFSET_FILE)");
+
+    # Reap on death so we don't leave a zombie when supervisor checks fire.
+    # SIGCHLD handler would be cleaner but interacts badly with LMS's event
+    # loop in some versions — explicit waitpid in the supervise tick is safer.
+    return $pid;
+}
+
+# Stop the running helper. SIGTERM, brief wait, SIGKILL if still alive.
+sub _helperStop {
+    my $pid = _helperReadPid();
+    if (!$pid) {
+        _helperClearPid();
+        return 1;
+    }
+    kill('TERM', $pid);
+    for (1..10) {                    # up to ~1s
+        last unless kill(0, $pid);
+        Time::HiRes::usleep(100_000);
+    }
+    if (kill(0, $pid)) {
+        $log->warn("[helper] PID $pid didn't exit after SIGTERM; sending SIGKILL");
+        kill('KILL', $pid);
+        Time::HiRes::usleep(100_000);
+    }
+    # Reap so we don't leave a zombie. WNOHANG in case it's already cleaned up.
+    eval { waitpid($pid, 1); };      # POSIX::WNOHANG = 1
+    _helperClearPid();
+    $log->info("[helper] stopped PID $pid");
+    return 1;
+}
+
+sub _helperRestart {
+    _helperStop();
+    return _helperStart();
+}
+
+# Status snapshot for the settings UI / JSON endpoint.
+sub _helperStatus {
+    my $pid = _helperReadPid();
+    my ($depsOk, $depsErr) = _helperDepsCheck();
+    return {
+        running         => $pid ? 1 : 0,
+        pid             => $pid // 0,
+        port            => _helperPort(),
+        scriptPath      => _helperScriptPath() // '(unknown)',
+        logPath         => $HELPER_LOG_FILE,
+        depsOk          => $depsOk ? 1 : 0,
+        depsErr         => $depsErr // '',
+        pythonBin       => _helperPythonBin() // '',
+        serverModeEnabled => $prefs->get('vizServerMode') ? 1 : 0,
+        autoStartEnabled  => $prefs->get('vizHelperEnabled') ? 1 : 0,
+    };
+}
+
+# Supervisor tick. Runs every $HELPER_SUPERVISE_SECS seconds whenever the
+# plugin is loaded. Reconciles desired-vs-actual state: helper should be
+# running iff (vizServerMode AND vizHelperEnabled AND deps ok). If desired
+# but not running, spawn. If not desired but running, stop.
+sub _helperSupervise {
+    # Self-defence: if we're somehow running in a forked child of LMS (not
+    # the original parent), bail out IMMEDIATELY. See the comment on
+    # $LMS_OWNER_PID for context. This shouldn't fire — exec() should always
+    # replace the child — but a guard here means even if some future bug
+    # causes the child to keep running our Perl code, it can't multiply
+    # supervisor activity in the LMS clone.
+    _checkNotClone();
+
+    # KEEP THIS CHEAP. LMS runs a single-threaded event loop; this tick must
+    # complete in microseconds, not anything you can feel. Earlier versions
+    # walked /proc looking for orphans every 5 s — that stole enough event-loop
+    # time on busy systems to delay OTHER plugins' supervisors (UPnPBridge,
+    # CastBridge, etc.), which then thought their own child processes were
+    # dead and spawned replacements. Net effect: my plugin enabled = bridge
+    # plugins multiplying their squeezelite-like workers.
+    #
+    # Rule: pidfile reads only here. No /proc. No orphan hunting. If the user
+    # wants to clean up orphans they can use the /squeezelite?action=cleanup
+    # and /helper?action=cleanup endpoints (or just restart LMS).
+    my $serverOn = $prefs->get('vizServerMode') ? 1 : 0;
+
+    # --- Helper (Python FFT) ---
+    {
+        my $wantOn = $serverOn && $prefs->get('vizHelperEnabled');
+        my $pid    = _helperReadPid();
+        if ($wantOn && !$pid) {
+            my ($depsOk, undef) = _helperDepsCheck();
+            if ($depsOk) {
+                $log->info("[helper] supervisor: not running but should be; starting");
+                _helperStart();
+            }
+        } elsif (!$wantOn && $pid) {
+            $log->info("[helper] supervisor: running but should not be; stopping");
+            _helperStop();
+        }
+    }
+
+    # --- SqueezeLite (dedicated Visualizer instance) ---
+    {
+        my $wantOn = $serverOn && $prefs->get('vizSqueezeliteEnabled');
+        my $pid    = _sqzReadPid();
+        if ($wantOn && !$pid) {
+            $log->info("[sqz] supervisor: not running but should be; starting");
+            _sqzStart();
+        } elsif (!$wantOn && $pid) {
+            $log->info("[sqz] supervisor: running but should not be; stopping");
+            _sqzStop();
+        }
+    }
+
+    Slim::Utils::Timers::setTimer(undef,
+        Time::HiRes::time() + $HELPER_SUPERVISE_SECS,
+        \&_helperSupervise);
+}
+
+# ----------------------------------------------------------------------------
+# /helper endpoint — start/stop/restart/status/log over HTTP for the settings UI
+# ----------------------------------------------------------------------------
+# Find processes whose /proc/<pid>/cmdline matches a regex. Returns a list of
+# PIDs. Used to detect existing squeezelite/helper instances that aren't
+# tracked by our pidfile — orphans from prior plugin sessions, manually
+# started instances, or runaways from a crashed plugin. Without this, our
+# pidfile-only check happily spawns duplicates on top.
+#
+# Only matches OUR processes (running as the LMS user); we never look at or
+# touch other users' processes. /proc/<pid>/cmdline of a process not owned
+# by us reads as empty / EACCES, so the regex won't match.
+sub _findProcsByCmdline {
+    my ($re) = @_;
+    my @pids;
+    opendir(my $dh, '/proc') or return @pids;
+    while (my $entry = readdir $dh) {
+        next unless $entry =~ /^\d+$/;
+        my $pid = $entry;
+        my $cmdline = '';
+        if (open my $fh, '<', "/proc/$pid/cmdline") {
+            local $/ = undef;
+            $cmdline = <$fh>;
+            close $fh;
+        }
+        next unless $cmdline;
+        # /proc cmdline uses NUL separators between args
+        $cmdline =~ tr/\0/ /;
+        push @pids, $pid if $cmdline =~ /$re/;
+    }
+    closedir $dh;
+    return @pids;
+}
+
+# Kill any process matching the regex that ISN'T our tracked PID. Used at
+# spawn-time to clean up orphans before starting fresh — prevents two
+# squeezelites fighting for the same MAC or two helpers fighting for the
+# same WebSocket port.
+sub _killOrphans {
+    my ($re, $keepPid, $label) = @_;
+    my @found = _findProcsByCmdline($re);
+    my @orphans = grep { !defined($keepPid) || $_ != $keepPid } @found;
+    return 0 unless @orphans;
+    $log->info("[$label] found " . scalar(@orphans) . " orphan process(es): @orphans — killing");
+    for my $pid (@orphans) {
+        kill('TERM', $pid);
+    }
+    # Brief grace, then SIGKILL stragglers.
+    Time::HiRes::usleep(200_000);
+    for my $pid (@orphans) {
+        if (kill(0, $pid)) {
+            kill('KILL', $pid);
+        }
+    }
+    # Reap zombies (our children).
+    for my $pid (@orphans) {
+        eval { waitpid($pid, 1); };               # POSIX::WNOHANG = 1
+    }
+    return scalar(@orphans);
+}
+
+# ----------------------------------------------------------------------------
+# Bundled SqueezeLite supervisor — same pattern as the FFT helper
+# ----------------------------------------------------------------------------
+#
+# The dedicated headless Visualizer SqueezeLite instance. We fork+exec a system
+# squeezelite binary (located via PATH) with an argv list (no shell quoting
+# issues — the systemd unit had a MAC-with-colons problem that this avoids).
+# Snd-dummy must be loaded at boot so the Dummy ALSA card exists; that's the
+# ONE thing the user must still do at the system level (it requires root).
+#
+# Privilege note: the LMS plugin runs as 'squeezeboxserver'. For the spawned
+# SqueezeLite to open the Dummy ALSA device the squeezeboxserver user must be
+# in the 'audio' group. Setup README covers the one-time
+#   sudo usermod -aG audio squeezeboxserver
+# step. If group access fails, the squeezelite log file shows the ALSA error.
+
+my $SQZ_PID_FILE = '/tmp/nowplayingdisplay-squeezelite.pid';
+my $SQZ_LOG_FILE = '/tmp/nowplayingdisplay-squeezelite.log';
+
+# Locate the system squeezelite binary via PATH. Cached for the life of the
+# plugin — the binary doesn't move at runtime. Returns undef if not installed.
+my $_sqzBin;
+sub _sqzBin {
+    return $_sqzBin if defined $_sqzBin;
+    for my $cand ('/usr/bin/squeezelite', '/usr/local/bin/squeezelite', '/opt/squeezelite/squeezelite') {
+        if (-x $cand) { $_sqzBin = $cand; return $_sqzBin; }
+    }
+    chomp(my $found = `which squeezelite 2>/dev/null`);
+    $_sqzBin = ($found && -x $found) ? $found : '';
+    return $_sqzBin;
+}
+
+# Build the squeezelite argv list from prefs. Returned as a list (NOT a shell
+# string) so exec() takes it directly with no quoting/parsing in the middle.
+# This is exactly the bug the systemd unit hit: "-n Visualizer -m aa:bb:cc..."
+# under shell parsing turned the MAC's colons into argument separators.
+sub _sqzArgs {
+    my $mac = $prefs->get('vizPlayerMac') // '';
+    $mac =~ s/^\s+|\s+$//g;
+    my $name = 'Visualizer';
+    my $device = 'plughw:CARD=Dummy,DEV=0';   # snd-dummy ALSA card
+    my $lms  = '127.0.0.1';                   # local LMS
+    # Buffer tuning for the Visualizer SqueezeLite. Two goals:
+    #
+    # 1) Keep this player's effective latency LOW so it's always ahead of any
+    #    real room player (which buffers more for safety). That way the only
+    #    offsetting we ever need is "delay the visualizer to wait for the
+    #    room" — never "speed up the visualizer to catch up", which is
+    #    impossible (you can't see the future).
+    # 2) Make the SHMEM RING DEEP so the FFT helper can read back many
+    #    hundreds of milliseconds of audio history. Some rooms (WISA
+    #    systems, certain bridge endpoints) lag 500+ ms behind LMS; the
+    #    helper needs that much history in the ring to time-shift its FFT
+    #    read position to match.
+    #
+    # -b stream:output sizes the stream and output buffers in KILOBYTES.
+    #   stream=256 keeps ingest tight (low decode latency).
+    #   output=8192 gives ~1.5-2s of audio history in the visualizer shmem
+    #   ring at 16-bit stereo 44.1kHz (8192 KB / 4 bytes per frame =
+    #   2,097,152 frames; / 44100 Hz = 47s of mono-frame storage, halved
+    #   for stereo, halved again because shmem usually mirrors a fraction
+    #   of the output buffer — net ~1.5-2s of effective history).
+    # -a 20:2 sets the ALSA buffer time to 20 ms (default 40), keeping the
+    #   snd-dummy consumption point tight to where squeezelite is writing.
+    #
+    # Note: glitches on network hiccups don't matter — nothing actually
+    # *listens* to snd-dummy's output. The visualizer just analyzes the
+    # samples that pass through.
+    return (
+        '-n', $name,
+        '-m', $mac,
+        '-o', $device,
+        '-v',                                 # CRITICAL: enables shmem buffer
+        '-s', $lms,
+        '-b', '256:8192',                     # small ingest, deep output ring
+        '-a', '20:2:::',                      # 20 ms ALSA buffer, 2 periods
+    );
+}
+
+# PID/log helpers — same pattern as _helper*. The duplication is small enough
+# that abstracting it (a Process class etc.) would be more code than it saves.
+
+sub _sqzReadPid {
+    return undef unless -r $SQZ_PID_FILE;
+    open my $fh, '<', $SQZ_PID_FILE or return undef;
+    my $pid = <$fh>;
+    close $fh;
+    return undef unless defined $pid;
+    chomp $pid;
+    return undef unless $pid =~ /^\d+$/;
+    return undef unless kill(0, $pid);
+    # Verify the PID is actually squeezelite, not a recycled OS PID. See the
+    # comment in _helperReadPid.
+    return _pidCmdlineMatches($pid, qr/squeezelite/) ? $pid : undef;
+}
+
+sub _sqzWritePid {
+    my ($pid) = @_;
+    open my $fh, '>', $SQZ_PID_FILE or return;
+    print $fh "$pid\n";
+    close $fh;
+}
+
+sub _sqzClearPid { unlink $SQZ_PID_FILE if -e $SQZ_PID_FILE; }
+
+sub _sqzMaybeRotateLog {
+    return unless -e $SQZ_LOG_FILE;
+    my $sz = -s $SQZ_LOG_FILE // 0;
+    return if $sz < $HELPER_LOG_MAX_BYTES;
+    rename $SQZ_LOG_FILE, "$SQZ_LOG_FILE.old";
+}
+
+# Check that the Dummy ALSA card is present — that's the proxy for "is
+# snd-dummy loaded". Without it the spawn will start but immediately fail with
+# an ALSA error. Reading /proc/asound/cards is cheap.
+sub _sqzDummyCardLoaded {
+    return 0 unless -r '/proc/asound/cards';
+    open my $fh, '<', '/proc/asound/cards' or return 0;
+    my $present = 0;
+    while (my $line = <$fh>) {
+        if ($line =~ /\bDummy\b/) { $present = 1; last; }
+    }
+    close $fh;
+    return $present;
+}
+
+sub _sqzStart {
+    my $existing = _sqzReadPid();
+    if ($existing) {
+        $log->info("[sqz] already running (PID $existing); not starting another");
+        return $existing;
+    }
+
+    my $bin = _sqzBin();
+    if (!$bin) {
+        $log->error("[sqz] squeezelite binary not found in /usr/bin or PATH");
+        return undef;
+    }
+
+    if (!_sqzDummyCardLoaded()) {
+        $log->warn("[sqz] Dummy ALSA card not present — load snd-dummy first " .
+                   "(sudo modprobe snd-dummy, or put 'snd-dummy' in /etc/modules-load.d/)");
+        return undef;
+    }
+
+    my $mac = $prefs->get('vizPlayerMac') // '';
+    $mac =~ s/^\s+|\s+$//g;
+    if (!$mac) {
+        $log->error("[sqz] vizPlayerMac is empty — cannot start without a MAC");
+        return undef;
+    }
+
+    # NOTE: we do NOT scan /proc to clean up other squeezelites here. Walking
+    # /proc takes enough event-loop time that other plugins' supervisors miss
+    # heartbeats and respawn their own children. If you need to clean up
+    # orphans, use /plugins/NowPlayingDisplay/squeezelite?action=cleanup which
+    # does the scan deliberately on user request, not on every spawn.
+
+    _sqzMaybeRotateLog();
+
+    my @args = _sqzArgs();
+    my $pid = fork();
+    if (!defined $pid) {
+        $log->error("[sqz] fork failed: $!");
+        return undef;
+    }
+    if ($pid == 0) {
+        # See the long comment in _helperStart for the rationale. The child
+        # MUST exit (via exec replacement or _exit), never fall through into
+        # LMS event-loop code, because it inherited LMS's listening sockets
+        # and would create a phantom "squeezeboxserver" running on the same
+        # ports — which is the root cause of the multi-process cascade.
+        eval { setsid(); };
+
+        if (opendir(my $fdh, '/proc/self/fd')) {
+            while (my $f = readdir $fdh) {
+                next unless $f =~ /^\d+$/;
+                next if $f < 3;
+                POSIX::close($f + 0);
+            }
+            closedir $fdh;
+        }
+
+        # See the long comment in _helperStart re: untie. Same issue here.
+        untie *STDIN  if tied *STDIN;
+        untie *STDOUT if tied *STDOUT;
+        untie *STDERR if tied *STDERR;
+
+        open STDIN,  '<',  '/dev/null';
+        open STDOUT, '>>', $SQZ_LOG_FILE;
+        open STDERR, '>&', \*STDOUT;
+        select STDERR; $| = 1;
+        select STDOUT; $| = 1;
+        print STDOUT "\n=== squeezelite start " . scalar(localtime()) . " (pid $$) ===\n";
+
+        # exec() with an argv LIST — no shell, no quoting concerns. The
+        # `exec { $bin } $bin, @args` form is the explicit-filename form,
+        # safest against any indirect-object misparsing.
+        { exec { $bin } $bin, @args; }
+        print STDERR "[sqz] exec($bin ...) failed: $!\n";
+        POSIX::_exit(127);
+        CORE::exit(127);
+    }
+
+    _sqzWritePid($pid);
+    $log->info("[sqz] spawned PID $pid ($bin " . join(' ', @args) . ")");
+    return $pid;
+}
+
+sub _sqzStop {
+    my $pid = _sqzReadPid();
+    if (!$pid) {
+        _sqzClearPid();
+        return 1;
+    }
+    kill('TERM', $pid);
+    for (1..10) {
+        last unless kill(0, $pid);
+        Time::HiRes::usleep(100_000);
+    }
+    if (kill(0, $pid)) {
+        $log->warn("[sqz] PID $pid didn't exit after SIGTERM; sending SIGKILL");
+        kill('KILL', $pid);
+        Time::HiRes::usleep(100_000);
+    }
+    eval { waitpid($pid, 1); };
+    _sqzClearPid();
+    $log->info("[sqz] stopped PID $pid");
+    return 1;
+}
+
+sub _sqzRestart {
+    _sqzStop();
+    return _sqzStart();
+}
+
+sub _sqzStatus {
+    my $pid = _sqzReadPid();
+    return {
+        running           => $pid ? 1 : 0,
+        pid               => $pid // 0,
+        binary            => _sqzBin() // '',
+        dummyLoaded       => _sqzDummyCardLoaded() ? 1 : 0,
+        logPath           => $SQZ_LOG_FILE,
+        autoStartEnabled  => $prefs->get('vizSqueezeliteEnabled') ? 1 : 0,
+        serverModeEnabled => $prefs->get('vizServerMode') ? 1 : 0,
+    };
+}
+
+sub _handleSqueezelite {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $action = $q{action} // 'status';
+
+    my $out;
+    if ($action eq 'start')        { my $pid = _sqzStart(); $out = _sqzStatus(); $out->{action} = 'start';   $out->{ok} = $pid ? \1 : \0; }
+    elsif ($action eq 'stop')      { _sqzStop();            $out = _sqzStatus(); $out->{action} = 'stop';    $out->{ok} = \1; }
+    elsif ($action eq 'restart')   { _sqzRestart();         $out = _sqzStatus(); $out->{action} = 'restart'; $out->{ok} = $out->{running} ? \1 : \0; }
+    elsif ($action eq 'cleanup') {
+        # User-triggered orphan cleanup. Scans /proc for squeezelite processes
+        # using OUR configured MAC and kills any that aren't tracked in our
+        # pidfile. Deliberately opt-in (not in the supervisor) because the
+        # scan is expensive enough to disturb LMS's event loop.
+        my $tracked = _sqzReadPid();
+        my $mac = $prefs->get('vizPlayerMac') // '';
+        $mac =~ s/^\s+|\s+$//g;
+        my $killed = 0;
+        if ($mac) {
+            my $macRe = quotemeta(lc($mac));
+            $killed = _killOrphans('squeezelite.*-m\s+' . $macRe, $tracked, 'sqz-cleanup');
+        }
+        $out = _sqzStatus();
+        $out->{action}    = 'cleanup';
+        $out->{ok}        = \1;
+        $out->{killed}    = $killed;
+    }
+    elsif ($action eq 'log') {
+        my $tail = '';
+        if (-r $SQZ_LOG_FILE) {
+            my $size = -s $SQZ_LOG_FILE;
+            my $offset = $size > 16384 ? $size - 16384 : 0;
+            if (open my $fh, '<', $SQZ_LOG_FILE) {
+                seek $fh, $offset, 0;
+                local $/ = undef;
+                $tail = <$fh>;
+                close $fh;
+            }
+        } else {
+            $tail = "(no log file yet at $SQZ_LOG_FILE)\n";
+        }
+        _send($httpClient, $response, 'text/plain; charset=utf-8', $tail, no_cache => 1);
+        return;
+    }
+    else { $out = _sqzStatus(); $out->{action} = 'status'; }
+
+    _send($httpClient, $response, 'application/json', encode_json($out), no_cache => 1);
+}
+
+# ----------------------------------------------------------------------------
+# Sync calibration
+# ----------------------------------------------------------------------------
+#
+# Two pieces:
+#   /plugins/NowPlayingDisplay/calibration/<tone>.wav
+#       Static file server for the calibration tones from Bin/. LMS fetches
+#       these via HTTP when commanded to "playlist play <url>".
+#   /plugins/NowPlayingDisplay/calibrate?action=start|stop&tone=<>&player=<>
+#       Orchestrates calibration on a named player. Sends the LMS playlist
+#       command to play the tone WAV, schedules an auto-stop in case the
+#       browser disappears mid-calibration.
+#
+# Calibration plays a known sine-wave burst pattern through the room. The
+# browser-side JS detects bursts on both the local audio analyser (browser-
+# audio mode) and the server-side WebSocket frames, pairs them by burst
+# index, and computes the offset between hearing and seeing. The result is
+# saved to the per-player offset map (vizPlayerOffsets) so it Just
+# Works on the next page load for that player.
+
+# Tones we know about. Adding a new one is: drop the WAV in Bin/, add an
+# entry here with its center frequency for the eyeball-mode visualizer band.
+my %CALIBRATION_TONES = (
+    '1khz'  => { file => 'calibration-1khz.wav',  freq => 1000, label => '1 kHz' },
+    '200hz' => { file => 'calibration-200hz.wav', freq =>  200, label => '200 Hz' },
+);
+
+# Track which calibrations are running so we can auto-stop them. Keyed by
+# player ID. Value is a Slim timer handle we can kill if the browser sends
+# an explicit stop before the auto-stop fires.
+my %CALIBRATION_ACTIVE;
+
+# Calibration WAV duration in seconds — keep in sync with the WAV files.
+# Plus a small grace period for the player to actually stop.
+# Calibration tone is now looped (repeat-track on) until the user explicitly
+# stops it. The safety auto-stop is just a backstop in case the browser tab
+# is closed without sending a stop — 10 minutes is plenty for any tuning
+# session while ensuring the room doesn't beep forever if forgotten.
+my $CALIBRATION_PLAY_SECONDS  = 16;     # length of one play-through of the WAV
+my $CALIBRATION_AUTOSTOP_SECS = 600;    # 10 min — safety net only
+
+sub _handleCalibrationWav {
+    my ($httpClient, $response) = @_;
+    # Extract the requested filename from the URI. Locked down to
+    # known-good tones so this can't serve anything else in Bin/.
+    my $path = $response->request->uri->path;
+    my ($name) = $path =~ m{/calibration/([\w-]+\.wav)\z};
+    if (!$name) {
+        $response->code(404);
+        Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \'');
+        return;
+    }
+    my $allowed = 0;
+    for my $tone (values %CALIBRATION_TONES) {
+        if ($tone->{file} eq $name) { $allowed = 1; last; }
+    }
+    if (!$allowed) {
+        $response->code(404);
+        Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \'');
+        return;
+    }
+
+    my $basedir = eval {
+        Slim::Utils::PluginManager->allPlugins->{'NowPlayingDisplay'}->{'basedir'}
+    };
+    my $file = $basedir ? catfile($basedir, 'Bin', $name) : undef;
+    $file = Slim::Utils::OSDetect::getOS->decodeExternalHelperPath($file) if $file;
+
+    if (!$file || !-r $file) {
+        $log->error("[calib] WAV file not found: " . ($file // '(undef)'));
+        $response->code(404);
+        Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \'');
+        return;
+    }
+
+    # Read and serve. WAVs are ~1.4MB each; reading whole into memory is
+    # fine. Not using streaming because Slim::Web::HTTP's response model is
+    # whole-body anyway.
+    my $body = '';
+    if (open my $fh, '<', $file) {
+        binmode $fh;
+        local $/ = undef;
+        $body = <$fh>;
+        close $fh;
+    }
+    $response->code(200);
+    $response->header('Content-Type'   => 'audio/wav');
+    $response->header('Content-Length' => length($body));
+    # No-cache so a re-generated tone (different volume, different burst
+    # pattern in a future version) gets picked up immediately. Tiny cost
+    # for an operation only run during calibration.
+    $response->header('Cache-Control' => 'no-store');
+    Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$body);
+}
+
+sub _handleCalibrate {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $action = $q{action} // 'status';
+    my $tone   = $q{tone}   // '1khz';
+    my $playerId = $q{player} // '';
+
+    my $tcfg = $CALIBRATION_TONES{$tone};
+    if (!$tcfg) {
+        _send($httpClient, $response, 'application/json',
+              encode_json({ ok => \0, error => "unknown tone: $tone" }),
+              no_cache => 1);
+        return;
+    }
+
+    # Resolve the player. forClient() returns the Slim::Player::Client object,
+    # or undef if the MAC isn't registered. Safety: refuse to calibrate against
+    # the Visualizer player itself — that'd be measuring the system against
+    # itself (always zero) and would interrupt the visualizer's audio capture.
+    $playerId =~ s/^\s+|\s+$//g;
+    my $vizMac = $prefs->get('vizPlayerMac') // '';
+    if (lc($playerId) eq lc($vizMac)) {
+        _send($httpClient, $response, 'application/json',
+              encode_json({ ok => \0, error => 'cannot calibrate the Visualizer player itself' }),
+              no_cache => 1);
+        return;
+    }
+    my $client = $playerId ? Slim::Player::Client::getClient($playerId) : undef;
+    if (!$client) {
+        _send($httpClient, $response, 'application/json',
+              encode_json({ ok => \0, error => "unknown player: $playerId" }),
+              no_cache => 1);
+        return;
+    }
+
+    if ($action eq 'start') {
+        # Resolve the calibration WAV's path on disk. The plugin runs on the
+        # LMS box; LMS can play local files natively via file:// URLs — same
+        # as your music library — bypassing HTTP entirely. This avoids the
+        # self-referential loop where LMS would otherwise try to open an
+        # HTTP URL that points back at itself (which trips a socket-bind
+        # quirk in Slim::Player::Protocols::HTTP and never connects).
+        my $basedir = eval {
+            Slim::Utils::PluginManager->allPlugins->{'NowPlayingDisplay'}->{'basedir'}
+        };
+        my $wavPath = $basedir ? catfile($basedir, 'Bin', $tcfg->{file}) : undef;
+        $wavPath = Slim::Utils::OSDetect::getOS->decodeExternalHelperPath($wavPath) if $wavPath;
+        if (!$wavPath || !-r $wavPath) {
+            $log->error("[calib] WAV not found at expected path: " . ($wavPath // '(undef)'));
+            _send($httpClient, $response, 'application/json',
+                  encode_json({ ok => \0, error => 'calibration WAV missing on disk' }),
+                  no_cache => 1);
+            return;
+        }
+        my $url = Slim::Utils::Misc::fileURLFromPath($wavPath);
+        $log->info("[calib] start tone=$tone player=$playerId url=$url");
+
+        # Cancel any prior auto-stop for this player.
+        if (my $prior = delete $CALIBRATION_ACTIVE{$playerId}) {
+            eval { Slim::Utils::Timers::killTimers(undef, $prior->{stop_ref}); };
+        }
+
+        # Remember the player's current repeat mode so we can restore it
+        # when calibration stops. The 'playlist repeat ?' query returns the
+        # current value as a string: 0=none, 1=track, 2=playlist.
+        my $prevRepeat = eval {
+            my $req = Slim::Control::Request->new($client->id, ['playlist', 'repeat', '?']);
+            $req->execute();
+            $req->getResult('_repeat');
+        };
+        $prevRepeat = 0 unless defined $prevRepeat && $prevRepeat =~ /^\d+$/;
+
+        # Play the WAV and set repeat-track so it loops continuously.
+        # `playlist play <url>` clears the current queue and starts immediately;
+        # `playlist repeat 1` makes it loop the single track. Together: the
+        # tone plays forever until we explicitly stop it (or the safety
+        # timer fires).
+        $client->execute(['playlist', 'play', $url]);
+        $client->execute(['playlist', 'repeat', 1]);
+
+        # Safety net: stop after a generous timeout so the room doesn't
+        # beep forever if the browser tab is closed without a stop. The
+        # closure captures both the player ID and the repeat mode to restore.
+        my $stopRef = sub { _calibrationStop($playerId, $prevRepeat); };
+        $CALIBRATION_ACTIVE{$playerId} = {
+            stop_ref     => $stopRef,
+            prev_repeat  => $prevRepeat,
+        };
+        Slim::Utils::Timers::setTimer($client,
+            Time::HiRes::time() + $CALIBRATION_AUTOSTOP_SECS,
+            $stopRef);
+
+        _send($httpClient, $response, 'application/json',
+              encode_json({
+                  ok => \1, action => 'start', tone => $tone,
+                  freq => $tcfg->{freq}, duration => $CALIBRATION_PLAY_SECONDS,
+                  player => $playerId, url => $url,
+              }),
+              no_cache => 1);
+        return;
+    }
+    elsif ($action eq 'stop') {
+        my $entry = $CALIBRATION_ACTIVE{$playerId};
+        my $prevRepeat = $entry ? $entry->{prev_repeat} : 0;
+        _calibrationStop($playerId, $prevRepeat);
+        _send($httpClient, $response, 'application/json',
+              encode_json({ ok => \1, action => 'stop', player => $playerId }),
+              no_cache => 1);
+        return;
+    }
+
+    # status (default)
+    _send($httpClient, $response, 'application/json',
+          encode_json({
+              ok => \1, action => 'status',
+              active => $CALIBRATION_ACTIVE{$playerId} ? \1 : \0,
+              tones => [ map {
+                  { id => $_, label => $CALIBRATION_TONES{$_}{label},
+                    freq => $CALIBRATION_TONES{$_}{freq} }
+              } sort keys %CALIBRATION_TONES ],
+          }),
+          no_cache => 1);
+}
+
+# Stop calibration on a player: fully tear down the playback so the device
+# audio output is released. Just calling 'stop' / 'playlist clear' leaves
+# the stream half-open on some players (especially with local file:// URLs
+# that go through LMS's streaming pipeline) — the device handle stays held
+# and subsequent track plays get blocked or skip. The reliable way to
+# release everything is a power-cycle: power 0 tears down all streams and
+# closes the device, power 1 reopens it clean.
+#
+# Idempotent — safe to call when no calibration is running.
+sub _calibrationStop {
+    my ($playerId, $prevRepeat) = @_;
+    return unless $playerId;
+    my $client = Slim::Player::Client::getClient($playerId);
+    if ($client) {
+        $log->info("[calib] stop player=$playerId restore-repeat=" . ($prevRepeat // '?'));
+        # 1. Stop playback and clear our looping WAV from the queue.
+        eval { $client->execute(['stop']); };
+        eval { $client->execute(['playlist', 'clear']); };
+        # 2. Power-cycle the player to fully release the audio device. Without
+        #    this, the file:// stream can stay in a half-open state with the
+        #    device handle held — symptom is subsequent tracks failing to
+        #    play or appearing to skip immediately. The 0→1 sequence is
+        #    instantaneous from the user's perspective; no audible click.
+        eval { $client->execute(['power', 0]); };
+        eval { $client->execute(['power', 1]); };
+        # 3. Restore the repeat mode we changed at start time (if we changed it).
+        if (defined $prevRepeat && $prevRepeat =~ /^\d+$/) {
+            eval { $client->execute(['playlist', 'repeat', $prevRepeat]); };
+        }
+    }
+    if (my $entry = delete $CALIBRATION_ACTIVE{$playerId}) {
+        eval { Slim::Utils::Timers::killTimers(undef, $entry->{stop_ref}); };
+    }
+}
+
+sub _handleHelper {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $action = $q{action} // 'status';
+
+    my $out;
+    if ($action eq 'start') {
+        my $pid = _helperStart();
+        $out = _helperStatus();
+        $out->{action} = 'start';
+        $out->{ok}     = $pid ? \1 : \0;
+    } elsif ($action eq 'stop') {
+        _helperStop();
+        $out = _helperStatus();
+        $out->{action} = 'stop';
+        $out->{ok}     = \1;
+    } elsif ($action eq 'restart') {
+        _helperRestart();
+        $out = _helperStatus();
+        $out->{action} = 'restart';
+        $out->{ok}     = ($out->{running} ? \1 : \0);
+    } elsif ($action eq 'log') {
+        # Return last ~50 lines of the helper log as plain text.
+        my $tail = '';
+        if (-r $HELPER_LOG_FILE) {
+            # Read last ~16KB so we're not pulling a huge file.
+            my $size = -s $HELPER_LOG_FILE;
+            my $offset = $size > 16384 ? $size - 16384 : 0;
+            if (open my $fh, '<', $HELPER_LOG_FILE) {
+                seek $fh, $offset, 0;
+                local $/ = undef;
+                $tail = <$fh>;
+                close $fh;
+            }
+        } else {
+            $tail = "(no log file yet at $HELPER_LOG_FILE)\n";
+        }
+        _send($httpClient, $response, 'text/plain; charset=utf-8', $tail, no_cache => 1);
+        return;
+    } elsif ($action eq 'cleanup') {
+        # User-triggered orphan cleanup. Scans /proc for helper processes
+        # not tracked in our pidfile. Same reasoning as the squeezelite
+        # cleanup action.
+        my $tracked = _helperReadPid();
+        my $killed = _killOrphans('npd-vizfft\.py', $tracked, 'helper-cleanup');
+        $out = _helperStatus();
+        $out->{action} = 'cleanup';
+        $out->{ok}     = \1;
+        $out->{killed} = $killed;
+    } elsif ($action eq 'recheck-deps') {
+        _helperDepsCheck(1);              # force
+        $out = _helperStatus();
+        $out->{action} = 'recheck-deps';
+        $out->{ok}     = \1;
+    } else {
+        $out = _helperStatus();
+        $out->{action} = 'status';
+    }
+
+    _send($httpClient, $response, 'application/json',
+          encode_json($out), no_cache => 1);
+}
+
+# Plugin shutdown hook — LMS calls this when the plugin is disabled or the
+# server is shutting down. Stop the helper cleanly so we don't orphan it.
+sub shutdownPlugin {
+    my $class = shift;
+    _helperStop();
+    _sqzStop();
+}
 
 sub initPlugin {
     my $class = shift;
     $class->SUPER::initPlugin(@_);
+
+    # Fold any deprecated named-preset assignments into the flat per-player
+    # offset map before anything reads offsets. Idempotent / no-op once done.
+    eval { _migratePlayerOffsets(); };
+    $log->error("[viz] offset migration failed: $@") if $@;
 
     # Settings page registration. The Settings.pm module subclasses
     # Slim::Web::Settings and shows up under Settings → Advanced. Skip
@@ -82,6 +1284,9 @@ sub initPlugin {
         qr{^/plugins/NowPlayingDisplay/setoffset\b},     \&_handleSetOffset,
     );
     Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/setlivenoffset\b}, \&_handleSetLiveOffset,
+    );
+    Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/setstyle\b},      \&_handleSetStyle,
     );
     Slim::Web::Pages->addRawFunction(
@@ -89,6 +1294,25 @@ sub initPlugin {
     );
     Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/streamproxy\b},   \&_handleStreamProxy,
+    );
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/helper\b},        \&_handleHelper,
+    );
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/squeezelite\b},   \&_handleSqueezelite,
+    );
+    # Calibration tone WAV files served straight from the plugin's Bin/.
+    # LMS itself fetches these via HTTP when we send it a "playlist play
+    # <url>" command — same loopback pattern any plugin uses to feed audio.
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/calibration/[\w-]+\.wav\b},
+        \&_handleCalibrationWav,
+    );
+    # Calibration orchestration: starts/stops calibration playback on a
+    # named player, with cleanup so playback doesn't run forever if the
+    # browser tab is closed mid-calibration.
+    Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/calibrate\b},     \&_handleCalibrate,
     );
     Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/page\b},          \&_handlePage,
@@ -107,6 +1331,25 @@ sub initPlugin {
     );
 
     $log->info("NowPlayingDisplay initialised — open http://<lms>:9000/plugins/NowPlayingDisplay/page");
+
+    # Kick off the helper supervisor. It self-reschedules every 5s and
+    # reconciles desired-vs-actual helper state. Spawning the helper is gated
+    # on server mode + autorun pref + deps present, so this is safe to start
+    # unconditionally — it just no-ops when the helper shouldn't be running.
+    # CRITICAL: kill any previously-scheduled supervisor first. LMS can call
+    # initPlugin multiple times (plugin enable/disable cycles, reload after a
+    # version bump). Without killTimers, each call would stack another
+    # supervisor chain — they'd all fire every 5s in parallel, each spawning
+    # its own helper/squeezelite, multiplying processes.
+    Slim::Utils::Timers::killTimers(undef, \&_helperSupervise);
+    Slim::Utils::Timers::setTimer(undef,
+        Time::HiRes::time() + 2,                   # first tick 2s after boot
+        \&_helperSupervise);
+
+    # Stage 2 auto-follow: subscribe to player events so we re-mirror the
+    # active room onto the Visualizer player automatically. Only registers
+    # when server mode is on; safe to call repeatedly (idempotent).
+    _vizAutoEnsureSubscribed();
 }
 
 # LMS calls webPages() to (re)register menu links, including after the plugin
@@ -268,9 +1511,29 @@ sub _snapshotFor {
     return $snap;
 }
 
+# Helper: is this client the dedicated server-side Visualizer SqueezeLite?
+# When server-mode auto-follow is on, that player is constantly playing a
+# mirror of the active room. We must exclude it from any "which player to
+# show / which is active" lookup, or the UI/page ends up following the
+# mirror instead of the real listening room (the page would see the
+# Visualizer's stream URL, which may be local-only resolved or empty,
+# producing the "only available for local library tracks" hint).
+sub _isVizPlayer {
+    my ($client) = @_;
+    return 0 unless $client;
+    # No filtering if server mode is off — the Visualizer SqueezeLite isn't
+    # running, so there's nothing to exclude.
+    return 0 unless $prefs->get('vizServerMode');
+    my $vizMac = $prefs->get('vizPlayerMac') // '';
+    $vizMac =~ s/^\s+|\s+$//g;
+    return 0 unless $vizMac;
+    return lc($client->id // '') eq lc($vizMac) ? 1 : 0;
+}
+
 sub _playerList {
     my @out;
     for my $c (Slim::Player::Client::clients()) {
+        next if _isVizPlayer($c);   # hide the dedicated Visualizer from the dropdown
         # Determine state cheaply — no full status query needed for the list.
         my $state = $c->isPlaying ? 'playing'
                   : $c->isPaused  ? 'paused' : 'stopped';
@@ -294,9 +1557,14 @@ sub _playerList {
 
 # ----- HTTP handlers ---------------------------------------------------------
 
-# Persist the visualizer default offset from the on-screen tuner. Accepts
-# ?ms=<signed int>. Clamped to the same range as the settings field. Returns
-# the saved value as JSON so the page can confirm.
+# Persist the visualizer sync offset from the on-screen tuner Save button.
+# Accepts ?ms=<signed int> and ?player=<id>. Saves straight to that player's
+# entry in vizPlayerOffsets (the per-player sync map), so each room keeps its
+# own offset. Falls back to the global default (vizDelayMs) only when no player
+# is resolvable (ambient / no-player pages). Returns the saved value as JSON.
+#
+# Also writes the helper offset file so the server-mode FFT-read window updates
+# immediately (the helper polls it at ~100ms).
 sub _handleSetOffset {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
@@ -307,9 +1575,59 @@ sub _handleSetOffset {
     $ms = -2000 if $ms < -2000;
     $ms =  2000 if $ms >  2000;
     $ms = int($ms);
-    $prefs->set('vizDelayMs', $ms);
+
+    # The on-screen tuner is always tuning the room currently displayed/followed.
+    # The page sends ?player=<id>; we save directly to that player so the offset
+    # never bleeds onto other rooms. (Guard against the Visualizer's own MAC.)
+    my $playerId = $q{player} // '';
+    $playerId =~ s/^\s+|\s+$//g;
+    my $vizMac = lc($prefs->get('vizPlayerMac') // '');
+    my $client = ($playerId && lc($playerId) ne $vizMac)
+        ? Slim::Player::Client::getClient($playerId) : undef;
+
+    my $scope;
+    if ($client) {
+        my $pid  = $client->id;
+        my $offs = $prefs->get('vizPlayerOffsets') || {};
+        $offs    = {} unless ref($offs) eq 'HASH';
+        $offs->{$pid} = $ms;
+        $prefs->set('vizPlayerOffsets', $offs);
+        $scope = 'player';
+        $log->info("[viz] saved offset ${ms}ms for player $pid (" . $client->name . ")");
+    } else {
+        # No resolvable player — fall back to the global default.
+        $prefs->set('vizDelayMs', $ms);
+        $scope = 'global';
+        $log->info("[viz] saved global default offset ${ms}ms");
+    }
+
+    # Apply live. The tuned player is the one currently being followed, so
+    # writing $ms here takes effect on the helper's next poll (~100ms). The
+    # helper clamps negatives to 0 (can't show future audio); browser-audio mode
+    # still uses the signed value for its own seek.
+    _writeOffsetFile($ms);
     _send($httpClient, $response, 'application/json',
-          encode_json({ ok => \1, ms => $ms }), no_cache => 1);
+          encode_json({ ok => \1, ms => $ms, scope => $scope,
+                        playerId => ($client ? $client->id : undef) }),
+          no_cache => 1);
+}
+
+# Transient offset update — for the ±10/±50 nudge buttons. Updates the helper
+# offset file so the user sees the change immediately, but does NOT persist
+# the value to the preset. The Save button hits /setoffset for that.
+sub _handleSetLiveOffset {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $ms = $q{ms};
+    $ms = '' unless defined $ms;
+    $ms =~ s/[^\-\d]//g;
+    $ms = 0 unless $ms =~ /^-?\d+$/;
+    $ms = -2000 if $ms < -2000;
+    $ms =  2000 if $ms >  2000;
+    $ms = int($ms);
+    my $written = _writeOffsetFile($ms);
+    _send($httpClient, $response, 'application/json',
+          encode_json({ ok => \1, ms => $ms, applied => $written }), no_cache => 1);
 }
 
 # Persist the visualizer style from the on-screen Style button.
@@ -317,11 +1635,337 @@ sub _handleSetStyle {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
     my $style = $q{style} // '';
-    my %valid = map { $_ => 1 } qw(segmented scope starburst bokeh);
+    my %valid = map { $_ => 1 } qw(segmented scope ring ringVivid ringZoom ringClassic starburst bokeh);
     $style = 'segmented' unless $valid{$style};
     $prefs->set('vizStyle', $style);
     _send($httpClient, $response, 'application/json',
           encode_json({ ok => \1, style => $style }), no_cache => 1);
+}
+
+# ---------------------------------------------------------------------------
+# Server-side visualizer: mirror the active room onto the dedicated headless
+# Visualizer player. Stage 1 (manual button) + Stage 2 (auto-follow on player
+# events).
+#
+# *** SAFETY DESIGN ***
+# Every command issued through this code path goes to ONE specific player —
+# the one whose id (MAC) matches the configured `vizPlayerMac` pref. The
+# lookup helper (_vizFindVisualizer) is the choke point; it returns the client
+# only if the id matches exactly. All mirror/seek/stop actions take that
+# vetted client as input. There is no code path where a real listening player
+# could receive a command, because the lookup always returns either the
+# Visualizer player or undef.
+# ---------------------------------------------------------------------------
+
+# Module-level state for stage 2 (auto-follow).
+my $_vizAutoSubscribed = 0;
+my $_vizLastSource     = '';   # client id of source we're currently mirroring
+my $_vizLastTrackUrl   = '';   # last track url commanded to Visualizer
+my $_vizNoVizLogged    = 0;    # throttle for "no Visualizer player" log
+my $_vizAutoOffLogged  = 0;    # throttle for "auto-follow disabled" log
+# Player the visualizer should follow, as chosen by the display page. Empty =
+# auto (follow the most-active room). Set from the page's state.json poll, which
+# carries its ?player= selection every tick. NOTE: there is a single shared
+# Visualizer SqueezeLite, so this is global — if two displays pin different
+# rooms, the most recent poll wins. Fine for a single active display.
+my $_vizDesiredSource  = '';
+
+# Locate the Visualizer player by configured MAC. Returns the Slim::Player
+# client object only on exact (case-insensitive) match, or undef if not found
+# or no MAC is configured. THIS IS THE SAFETY CHOKEPOINT — every command path
+# starts from here.
+sub _vizFindVisualizer {
+    my $vizMac = $prefs->get('vizPlayerMac') // '';
+    $vizMac =~ s/^\s+|\s+$//g;
+    return (undef, '') unless $vizMac;
+    for my $c (Slim::Player::Client::clients()) {
+        my $id = lc($c->id // '');
+        if ($id eq lc($vizMac)) {
+            return ($c, $vizMac);
+        }
+    }
+    return (undef, $vizMac);
+}
+
+# Pick the "active" source room to mirror. Strategy: the most recently-started
+# playing client, excluding the Visualizer player itself. **Paused players are
+# still considered active** — pause is just "play state == pause", not "no
+# longer the room we care about". Returns undef only when no real player has
+# anything queued/playing.
+sub _vizPickActiveSource {
+    my ($vizClient) = @_;
+    my $vizId = $vizClient ? lc($vizClient->id // '') : '';
+    my $best;
+    my $bestStart = -1;
+    my $bestPlaying = 0;
+    for my $c (Slim::Player::Client::clients()) {
+        next unless $c;
+        next if $vizId && lc($c->id // '') eq $vizId;   # never mirror ourselves
+        my $song = $c->playingSong;
+        next unless $song;                              # nothing queued at all
+        my $playing = $c->isPlaying ? 1 : 0;
+        my $start   = eval { $song->startOffset } // 0;
+        # Prefer playing over paused; among playing, prefer most recently
+        # started.
+        if (!$best
+            || ($playing && !$bestPlaying)
+            || ($playing == $bestPlaying && $start > $bestStart)) {
+            $best        = $c;
+            $bestStart   = $start;
+            $bestPlaying = $playing;
+        }
+    }
+    return $best;
+}
+
+# Issue the mirror commands: clear + play <url> + (delayed) seek to position.
+# The delayed seek is essential — calling `time` immediately after `playlist
+# play` ran into the player having not yet loaded the stream, so the seek
+# would be ignored and playback would start from 0 (the "out of sync by a long
+# way" bug from stage 1).
+#
+# Returns 1 on success, 0 on failure, with optional info hash via $info ref.
+sub _vizMirrorAction {
+    my ($vizClient, $sourceClient, $info) = @_;
+    return 0 unless $vizClient && $sourceClient;
+
+    my $song = $sourceClient->playingSong;
+    if (!$song) {
+        _vizStop($vizClient);
+        $info->{stopped} = 1 if $info;
+        return 1;
+    }
+    my $trackUrl;
+    eval { $trackUrl = $song->track ? $song->track->url : '' };
+    $trackUrl //= '';
+    return 0 unless $trackUrl;
+
+    my $pos = 0;
+    eval { $pos = $sourceClient->songElapsedSeconds || 0 };
+    $pos = 0 if !defined $pos || $pos < 0;
+
+    # If we're already mirroring this exact track on the same source, do NOT
+    # re-issue 'time' every tick. A per-tick seek (this runs ~1/sec) caused a
+    # visible 1 Hz glitch — each seek re-opens/re-buffers the stream, which
+    # hitches the analysed audio. Only correct genuine drift, handled by the
+    # reconcile loop comparing positions.
+    my $srcId = $sourceClient->id // '';
+    if ($_vizLastSource eq $srcId && $_vizLastTrackUrl eq $trackUrl) {
+        $info->{seekedOnly} = 1 if $info;
+        $info->{alreadyMirroring} = 1 if $info;
+    } else {
+        my $playReq = Slim::Control::Request::executeRequest(
+            $vizClient, ['playlist', 'play', $trackUrl]
+        );
+        my $playOk = $playReq && !$playReq->isStatusError;
+        return 0 unless $playOk;
+        $_vizLastSource   = $srcId;
+        $_vizLastTrackUrl = $trackUrl;
+        # Delayed seek: fire after the stream's had a moment to load. Without
+        # this, 'time' fires before playback is actually established and is
+        # silently dropped → Visualizer plays from 0.
+        if ($pos > 0.5) {
+            Slim::Utils::Timers::setTimer(
+                undef, Time::HiRes::time() + 0.6,
+                sub {
+                    my ($vc, $newPos) = ($vizClient, $pos);
+                    # Re-vet the target one more time before commanding. By
+                    # the time the timer fires the client may have gone; refuse
+                    # if its id no longer matches the configured MAC.
+                    my ($recheck, $mac) = _vizFindVisualizer();
+                    return unless $recheck && lc($recheck->id // '') eq lc($vc->id // '');
+                    eval {
+                        Slim::Control::Request::executeRequest($vc, ['time', $newPos]);
+                    };
+                }
+            );
+        }
+    }
+
+    if ($info) {
+        $info->{sourceId} = $srcId;
+        $info->{trackUrl} = $trackUrl;
+        $info->{position} = $pos + 0;
+    }
+    return 1;
+}
+
+# Helper: stop the Visualizer player cleanly (used when the source isn't
+# playing). Safe to call even if the Visualizer is already idle.
+sub _vizStop {
+    my ($vizClient) = @_;
+    return unless $vizClient;
+    eval {
+        Slim::Control::Request::executeRequest($vizClient, ['playlist', 'clear']);
+    };
+    # Forget our "last mirrored" state so the next mirror is a fresh load.
+    $_vizLastSource   = '';
+    $_vizLastTrackUrl = '';
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2: auto-follow. Subscribe to LMS player events so any play/pause/stop/
+# newsong on a real room triggers a re-mirror onto the Visualizer player.
+# Subscription is enabled iff vizServerMode is on, and registered exactly
+# once (idempotent).
+# ---------------------------------------------------------------------------
+
+sub _vizAutoEnsureSubscribed {
+    # Despite the name (kept for call-site compatibility), this now starts a
+    # POLLING timer rather than event subscriptions. Polling proved far more
+    # robust than LMS's event API for this purpose: it's self-correcting (every
+    # tick reconciles the Visualizer with the active room), doesn't depend on
+    # getting event-matcher syntax exactly right, and ~1s lag on a track change
+    # is invisible for a visualizer.
+    return if $_vizAutoSubscribed;
+    if (!$prefs->get('vizServerMode')) {
+        $log->debug('[vizauto] not starting — server mode is off');
+        return;
+    }
+    $_vizAutoSubscribed = 1;
+    $log->info('[vizauto] starting auto-follow poll timer (1s)');
+    _vizAutoPoll();   # kick off immediately, then it re-schedules itself
+}
+
+# The poll: reconcile the Visualizer with whatever the active room is doing.
+# Re-schedules itself every second while server mode is on.
+sub _vizAutoPoll {
+    # Stop the loop cleanly if server mode gets turned off.
+    if (!$prefs->get('vizServerMode')) {
+        $_vizAutoSubscribed = 0;
+        $log->info('[vizauto] server mode off — stopping poll timer');
+        return;
+    }
+
+    eval { _vizReconcile(); };
+    if ($@) { $log->error("[vizauto] reconcile error: $@"); }
+
+    # Re-arm.
+    Slim::Utils::Timers::setTimer(
+        undef, Time::HiRes::time() + 1.0, \&_vizAutoPoll
+    );
+}
+
+# Core reconciliation: look at the active room, make the Visualizer match.
+sub _vizReconcile {
+    my ($vizClient, $vizMac) = _vizFindVisualizer();
+    if (!$vizClient) {
+        # Log occasionally (not every tick) so we can see the MAC mismatch /
+        # missing-player case without flooding the log.
+        $_vizNoVizLogged //= 0;
+        if (time() - $_vizNoVizLogged > 30) {
+            $_vizNoVizLogged = time();
+            $log->info("[vizauto] no connected Visualizer player matching MAC '" . ($vizMac // '') . "' — auto-follow idle");
+        }
+        return;
+    }
+
+    # Auto-follow (mirror) can be disabled to test native LMS sync grouping.
+    # When off we issue NO commands to the Visualizer — it can sit in a room's
+    # sync group as a passive follower without the mirror rewriting the shared
+    # queue. The player + helper keep running so capture still works.
+    if (!$prefs->get('vizAutoFollow')) {
+        $_vizAutoOffLogged //= 0;
+        if (time() - $_vizAutoOffLogged > 60) {
+            $_vizAutoOffLogged = time();
+            $log->info('[vizauto] auto-follow disabled (vizAutoFollow=0) — not mirroring; sync-test mode');
+        }
+        return;
+    }
+
+    # Choose the source the visualizer should mirror. If the display pinned a
+    # specific room, follow exactly that one (and show nothing when it isn't
+    # playing — handled by the isPlaying branch below). Only fall back to the
+    # most-active room when no room is pinned (auto), or when the pinned room
+    # has disconnected entirely.
+    my $source;
+    if ($_vizDesiredSource ne '') {
+        $source = Slim::Player::Client::getClient($_vizDesiredSource);
+        if (!$source) {
+            # Pinned player is gone — clear the pin and fall back to auto so we
+            # don't get stuck following a vanished player.
+            $log->info("[vizauto] pinned source $_vizDesiredSource not connected; reverting to auto");
+            $_vizDesiredSource = '';
+            $source = _vizPickActiveSource($vizClient);
+        }
+    } else {
+        $source = _vizPickActiveSource($vizClient);
+    }
+    if (!$source) {
+        # Nothing queued anywhere. Clear the Visualizer if it's still busy.
+        if ($_vizLastTrackUrl ne '') {
+            _vizStop($vizClient);
+            $log->info('[vizauto] no active source; stopped Visualizer');
+        }
+        return;
+    }
+
+    # Paused source -> pause Visualizer, keep state for a clean resume.
+    if (!$source->isPlaying) {
+        if ($vizClient->isPlaying) {
+            eval { Slim::Control::Request::executeRequest($vizClient, ['pause', 1]); };
+            $log->debug('[vizauto] source paused; paused Visualizer');
+        }
+        return;
+    }
+
+    # Source is playing. Figure out the source's current track + position.
+    my $song = $source->playingSong;
+    return unless $song;
+    my $trackUrl;
+    eval { $trackUrl = $song->track ? $song->track->url : '' };
+    $trackUrl //= '';
+    return unless $trackUrl;
+    my $srcId = $source->id // '';
+    my $pos = 0;
+    eval { $pos = $source->songElapsedSeconds || 0 };
+    $pos = 0 if !defined $pos || $pos < 0;
+
+    my $needNewTrack = ($_vizLastSource ne $srcId) || ($_vizLastTrackUrl ne $trackUrl);
+
+    if ($needNewTrack) {
+        # If we're switching SOURCE (not just track within the same source),
+        # the visualizer's offset should match the new room's per-player
+        # preset. Write the resolved offset to the helper file so its
+        # next FFT frame uses it. Doing this only on source-change avoids
+        # spurious file writes when the same room moves between tracks.
+        if ($_vizLastSource ne $srcId) {
+            my $newOffset = _resolveOffsetForPlayer($srcId);
+            _writeOffsetFile($newOffset);
+            $log->info("[vizauto] source -> $srcId; offset=${newOffset}ms");
+        }
+        # New track (or switched rooms) — load it onto the Visualizer.
+        my %info;
+        _vizMirrorAction($vizClient, $source, \%info);
+        $log->info("[vizauto] new track -> mirroring: " . encode_json(\%info));
+        return;
+    }
+
+    # Same track already loaded. Handle resume-after-pause and drift.
+    my $wasResumed = 0;
+    if (!$vizClient->isPlaying) {
+        # Resume transition: unpause AND force a re-seek to the source's current
+        # position. We can't rely on the drift check here — right after a pause
+        # the positions look aligned, but the ~1s poll latency + resume-command
+        # latency leaves the Visualizer lagging by a noticeable, sub-threshold
+        # amount that would never get corrected. Seeking on resume guarantees
+        # alignment at the moment playback restarts.
+        eval { Slim::Control::Request::executeRequest($vizClient, ['pause', 0]); };
+        eval { Slim::Control::Request::executeRequest($vizClient, ['time', $pos]); };
+        $wasResumed = 1;
+        $log->debug("[vizauto] resumed Visualizer + re-seek to ${pos}s");
+    }
+    return if $wasResumed;
+
+    # NO periodic drift re-seek. Once the right track is loaded and playing, we
+    # let it play through untouched. A drift re-seek here fired every tick —
+    # streaming has inherent buffer latency, so the Visualizer legitimately runs
+    # a few seconds behind the source, the drift threshold tripped constantly,
+    # and the resulting once-per-second seek re-buffered the stream and caused
+    # the 1 Hz glitch. The visualizer doesn't need tight position sync — it only
+    # needs smoothly-flowing audio to analyse; absolute position is irrelevant
+    # (and any audio-to-visual offset is handled by the sync-offset tuner). So
+    # we deliberately do nothing here.
 }
 
 # On-demand resolved stream URL for the visualizer. Called only when the
@@ -344,14 +1988,67 @@ sub _handleSetStyle {
 # This version relays a FINITE resource (a track file, e.g. Bandcamp). It is
 # NOT suitable for an endless live stream (e.g. Radio Paradise) — that needs a
 # true chunked relay, handled separately.
+#
+# Per-install proxy signing secret. Generated once on first use and persisted
+# in prefs. Used to HMAC URLs the plugin emits so the proxy can verify it
+# only relays URLs we ourselves issued (no SSRF via arbitrary ?url=).
+sub _proxySecret {
+    my $s = $prefs->get('proxySecret');
+    if (!$s || length($s) < 32) {
+        # 32 bytes of entropy → 64-char hex secret. Per-install, never sent
+        # to the client (only HMACs derived from it leave the server).
+        my $bytes = '';
+        for (1..32) { $bytes .= chr(int(rand(256))); }
+        $s = unpack('H*', $bytes);
+        $prefs->set('proxySecret', $s);
+    }
+    return $s;
+}
+
+# Sign a URL we're about to emit through /streamurl so /streamproxy can later
+# verify it. SHA-256 HMAC, hex-encoded. Digest::SHA is core Perl since 5.10
+# and is what LMS already depends on elsewhere.
+sub _signProxyUrl {
+    my ($url) = @_;
+    require Digest::SHA;
+    return Digest::SHA::hmac_sha256_hex($url, _proxySecret());
+}
+
+# Constant-time string compare so signature checks don't leak via early-exit
+# timing differences. Tiny win at this scale but free to do right.
+sub _constantTimeEq {
+    my ($a, $b) = @_;
+    return 0 if length($a) != length($b);
+    my $diff = 0;
+    for my $i (0 .. length($a) - 1) {
+        $diff |= ord(substr($a, $i, 1)) ^ ord(substr($b, $i, 1));
+    }
+    return $diff == 0;
+}
+
 sub _handleStreamProxy {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
     my $url = $q{url} // '';
+    my $sig = $q{sig} // '';
 
     unless ($url =~ m{^https?://}i) {
         $response->code(400);
         _send($httpClient, $response, 'text/plain', 'bad url', no_cache => 1);
+        return;
+    }
+
+    # HMAC gate — must match a signature this plugin issued from /streamurl.
+    # Without this, the proxy was an open relay: anyone reachable on the LMS
+    # port could fetch arbitrary http(s) URLs through us (SSRF against router
+    # admin pages, internal services, cloud metadata endpoints, etc.). Now
+    # only URLs we ourselves emitted are accepted, since only we know the
+    # per-install secret.
+    my $expected = _signProxyUrl($url);
+    if (!$sig || !_constantTimeEq($sig, $expected)) {
+        $log->warn('NowPlayingDisplay stream proxy: bad/missing signature, refusing');
+        $response->code(403);
+        _send($httpClient, $response, 'text/plain', 'forbidden', no_cache => 1);
         return;
     }
 
@@ -436,6 +2133,12 @@ sub _handleStreamUrl {
     }
 
     my $out = { url => $url, needsProxy => $needsProxy };
+    # If this URL is going to be proxied, include an HMAC the client can pass
+    # back to /streamproxy. Skipped when not proxied — direct CDN URLs (Qobuz)
+    # don't touch our server at all, so no need to sign them.
+    if ($url && ${$needsProxy}) {
+        $out->{sig} = _signProxyUrl($url);
+    }
     $out->{debug} = \%dbg if $debug;
     _send($httpClient, $response, 'application/json',
           encode_json($out), no_cache => 1);
@@ -445,6 +2148,25 @@ sub _handleStateJson {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
     my $playerId = $q{player} // '';
+
+    # Idempotent: ensures server-mode auto-follow is wired up. Picks up users
+    # who enable server mode in settings without an LMS restart.
+    _vizAutoEnsureSubscribed();
+
+    # Record which player this display wants the visualizer to follow. A manual
+    # selection pins the visualizer to THAT room; "auto"/empty lets it follow
+    # the most-active room (the original behaviour). The Visualizer's own MAC is
+    # never a valid source. This steers _vizReconcile / _vizPickActiveSource.
+    {
+        my $vizMac = lc($prefs->get('vizPlayerMac') // '');
+        if ($playerId eq '' || lc($playerId) eq 'auto') {
+            $_vizDesiredSource = '';
+        } elsif ($vizMac && lc($playerId) eq $vizMac) {
+            # ignore — never follow ourselves
+        } else {
+            $_vizDesiredSource = $playerId;
+        }
+    }
 
     # Resolve "auto" / empty to the most-recently-active player. Preference
     # order: currently playing > recently paused > anything connected.
@@ -475,18 +2197,23 @@ sub _handleStateJson {
 sub _liveConfig {
     my %speedMap = (low => 30, medium => 50, high => 80);
     my $scrollSpeed = $prefs->get('scrollSpeed') // 'medium';
-    my $presets = $prefs->get('vizPresets')   || [];
-    my $pmap    = $prefs->get('vizPlayerMap') || {};
+    my $offs = $prefs->get('vizPlayerOffsets') || {};
+    $offs = {} unless ref($offs) eq 'HASH';
     my $vizDefault = $prefs->get('vizDelayMs');
     $vizDefault = 0 unless defined $vizDefault && $vizDefault =~ /^-?\d+$/;
     return {
         scrollPx  => ($speedMap{$scrollSpeed} // 50),
         viz       => {
-            presets   => $presets,
-            playerMap => $pmap,
-            default   => $vizDefault + 0,
-            smoothing => ($prefs->get('vizSmoothing') // 'medium'),
-            style     => ($prefs->get('vizStyle') // 'segmented'),
+            playerOffsets => $offs,
+            default    => $vizDefault + 0,
+            smoothing  => ($prefs->get('vizSmoothing') // 'medium'),
+            style      => ($prefs->get('vizStyle') // 'segmented'),
+            # Server-side analysis mode (opt-in, default OFF): when on AND a
+            # bridgeUrl is configured, the page connects to the WebSocket and
+            # renders from server-computed band data, bypassing Web Audio. This
+            # is what enables Safari/iOS/TV-browser support.
+            serverMode => ($prefs->get('vizServerMode') ? \1 : \0),
+            bridgeUrl  => ($prefs->get('vizBridgeUrl') // ''),
         },
     };
 }
@@ -496,6 +2223,9 @@ sub _liveConfig {
 # displays where there's no human to choose.
 sub _autoActivePlayer {
     my @clients = Slim::Player::Client::clients();
+    # Exclude the dedicated Visualizer SqueezeLite — it's a mirror, not a
+    # listening room. Picking it here would make the page follow itself.
+    @clients = grep { !_isVizPlayer($_) } @clients;
     return unless @clients;
 
     # First preference: anything currently playing.
@@ -538,6 +2268,21 @@ sub _handlePlayersJson {
 
 my %LYR_CACHE;          # key (track URL) => { ts => time, body => {...} }
 my $LYR_TTL = 86400;    # 24h — lyrics don't change
+my $LYR_CACHE_MAX = 200;
+
+# Insert/refresh a cache entry, evicting the oldest entries by ts when over
+# the cap. Earlier versions only checked TTL on read, so stale-but-not-yet-
+# requested-again entries accumulated forever — slow leak on a long-running
+# LMS box. Cap+evict keeps the hash bounded with no extra timer needed.
+sub _cacheStore {
+    my ($cache, $cap, $key, $entry) = @_;
+    $cache->{$key} = $entry;
+    return unless scalar(keys %$cache) > $cap;
+    # Drop the 10% oldest in one pass so we don't do this work on every insert.
+    my $drop = int($cap * 0.10) || 1;
+    my @sorted = sort { $cache->{$a}{ts} <=> $cache->{$b}{ts} } keys %$cache;
+    for my $k (@sorted[0 .. $drop - 1]) { delete $cache->{$k}; }
+}
 
 sub _handleLyricsJson {
     my ($httpClient, $response) = @_;
@@ -619,7 +2364,8 @@ sub _handleLyricsJson {
     # Empty results shouldn't poison future queries — see _handleBiographyJson.
     if ((ref($payload->{lines}) eq 'ARRAY' && @{$payload->{lines}})
             || (defined $payload->{html} && length $payload->{html})) {
-        $LYR_CACHE{$cache_key} = { ts => time(), body => $payload };
+        _cacheStore(\%LYR_CACHE, $LYR_CACHE_MAX, $cache_key,
+                    { ts => time(), body => $payload });
     }
     _send($httpClient, $response, 'application/json',
           encode_json($payload), no_cache => 1);
@@ -714,6 +2460,7 @@ sub _parseLrcInline {
 
 my %BIO_CACHE;          # key => { ts => time, body => {...} }
 my $BIO_TTL = 3600;     # one hour is plenty for static biographies
+my $BIO_CACHE_MAX = 100;
 
 sub _handleBiographyJson {
     my ($httpClient, $response) = @_;
@@ -764,7 +2511,8 @@ sub _handleBiographyJson {
     # failed before we had the player-passing fix). Better to retry on each
     # request for empty bios than to return stale negative results.
     if ($payload->{html}) {
-        $BIO_CACHE{$key} = { ts => time(), body => $payload };
+        _cacheStore(\%BIO_CACHE, $BIO_CACHE_MAX, $key,
+                    { ts => time(), body => $payload });
     }
 
     _send($httpClient, $response, 'application/json',
@@ -775,8 +2523,10 @@ sub _handleBiographyJson {
 # MAI's biography handler is registered with needsClient=0 but in practice
 # behaves more reliably with a real client, matching what Material does.
 sub _anyConnectedClient {
-    my @clients = Slim::Player::Client::clients();
-    return $clients[0] || undef;
+    for my $c (Slim::Player::Client::clients()) {
+        return $c if $c->connected;
+    }
+    return undef;
 }
 
 # Dispatch a single MAI biography request and return { html, artist }.
@@ -838,22 +2588,22 @@ sub _handlePage {
     my $scrollPx = $speedMap{$scrollSpeed} // 50;
     my $vizEnabled = $prefs->get('enableVisualizer') ? 'true' : 'false';
 
-    # Visualizer offset resolution. We support named delay presets and a
-    # per-player assignment of a preset. The page resolves its own offset from
-    # these using its ?player= id. Shapes:
-    #   vizPresets   = [ { name=>'Lounge', ms=>215 }, ... ]
-    #   vizPlayerMap = { '<player_id>' => '<preset name>', ... }
-    #   vizDelayMs   = legacy/global default offset (fallback)
-    my $presets = $prefs->get('vizPresets')   || [];
-    my $pmap    = $prefs->get('vizPlayerMap') || {};
+    # Visualizer offset resolution. Each player has its own saved sync offset;
+    # the page resolves its offset from this map using its ?player= id, falling
+    # back to the global default. Shapes:
+    #   vizPlayerOffsets = { '<player_id>' => <ms>, ... }
+    #   vizDelayMs       = global default offset (fallback)
+    my $offs = $prefs->get('vizPlayerOffsets') || {};
+    $offs = {} unless ref($offs) eq 'HASH';
     my $vizDefault = $prefs->get('vizDelayMs');
     $vizDefault = 0 unless defined $vizDefault && $vizDefault =~ /^-?\d+$/;
     my $vizCfg = encode_json({
-        presets   => $presets,
-        playerMap => $pmap,
-        default   => $vizDefault + 0,
-        smoothing => ($prefs->get('vizSmoothing') // 'medium'),
-        style     => ($prefs->get('vizStyle') // 'segmented'),
+        playerOffsets => $offs,
+        default    => $vizDefault + 0,
+        smoothing  => ($prefs->get('vizSmoothing') // 'medium'),
+        style      => ($prefs->get('vizStyle') // 'segmented'),
+        serverMode => ($prefs->get('vizServerMode') ? \1 : \0),
+        bridgeUrl  => ($prefs->get('vizBridgeUrl') // ''),
     });
     $body =~ s/__NPD_DEFAULT_MODE__/$defaultMode/g;
     $body =~ s/__NPD_SCROLL_PX__/$scrollPx/g;
@@ -1307,6 +3057,25 @@ sub _pageHtml { return <<'HTML'; }
     padding: 3px 10px; border-radius: 8px; font-size: 0.8rem;
   }
 
+  /* Calibration tone buttons. When a tone is playing, the active button
+     glows so it's obvious which tone is on (and that "tap again to stop"
+     is the way to silence it). */
+  .viz-tcal {
+    font-size: 0.9rem;
+    background: rgba(255,255,255,0.06);
+  }
+  .viz-tcal.active {
+    background: #ff8040;
+    color: #000;
+    box-shadow: 0 0 12px #ff8040;
+    animation: viz-tcal-pulse 1s ease-in-out infinite;
+  }
+  @keyframes viz-tcal-pulse {
+    0%, 100% { box-shadow: 0 0 8px #ff8040; }
+    50%      { box-shadow: 0 0 20px #ff8040; }
+  }
+
+
   /* ===== Mode: biography ============================================= */
   /* Two-column split: artist image + now-playing meta on the left, the
      biography body scrolls on the right. Layout collapses to a stacked
@@ -1758,8 +3527,15 @@ sub _pageHtml { return <<'HTML'; }
       <button id="viz-plus10" class="viz-tbtn" title="+10 ms">+10</button>
       <button id="viz-tsave" class="viz-tbtn viz-tsave">Save</button>
       <button id="viz-tstyle" class="viz-tbtn viz-tstyle">Style</button>
+      <!-- Calibration tones. Plays a looping click train through the current
+           room so the user can nudge the offset (with the ±buttons above)
+           until the visualizer's bars hit on the clicks. Each button toggles
+           its own tone on/off; switching to the other tone stops the first. -->
+      <button id="viz-tcal1k"  class="viz-tbtn viz-tcal" title="Start 1 kHz calibration tone">♪ 1k</button>
+      <button id="viz-tcal200" class="viz-tbtn viz-tcal" title="Start 200 Hz calibration tone">♪ 200</button>
       <div id="viz-tsaved" class="viz-tsaved" hidden>Saved</div>
     </div>
+
     <audio id="viz-audio" preload="auto" playsinline></audio>
   </section>
 
@@ -1791,8 +3567,14 @@ sub _pageHtml { return <<'HTML'; }
   // unsupported there and we don't offer it.
   const VIZ_IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
                   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  // In server-side analysis mode the page never touches Web Audio (the iOS
+  // wall), so iOS is fine and the visualizer should be available. This must
+  // be computed BEFORE the iOS visibility gate below.
+  const VIZ_CFG_PEEK = __NPD_VIZ_CFG__;
+  const VIZ_SERVER_AVAILABLE = !!(VIZ_CFG_PEEK && VIZ_CFG_PEEK.serverMode && VIZ_CFG_PEEK.bridgeUrl)
+                              || (location.search.indexOf('server=1') !== -1);
   const VALID_MODES = ['now-playing', 'artwork', 'lyrics', 'ambient', 'vinyl', 'biography'];
-  if (VIZ_ENABLED && !VIZ_IS_IOS) {
+  if (VIZ_ENABLED && (!VIZ_IS_IOS || VIZ_SERVER_AVAILABLE)) {
     VALID_MODES.push('visualizer');
     const vb = document.getElementById('viz-btn');
     if (vb) vb.hidden = false;
@@ -1837,6 +3619,12 @@ sub _pageHtml { return <<'HTML'; }
     // stream/transcode audio unless the user is actually looking at it.
     if (mode === 'visualizer') vizStart();
     else vizStop();
+
+    // Lyrics + biography animation loops also only run while their mode is
+    // active. They self-terminate by not rescheduling once currentMode moves
+    // away; these starters kick them off again on re-entry.
+    startLyricsTickIfNeeded();
+    startBioFrameIfNeeded();
   }
 
   // Wire up the icon row.
@@ -1972,9 +3760,18 @@ sub _pageHtml { return <<'HTML'; }
         { cache: 'no-store' }
       );
       const d = await r.json();
+      const prevPid = lastSnap && lastSnap.player && lastSnap.player.id;
+      const newPid  = d && d.player && d.player.id;
       apply(d);
       noteTimeFromSnap(d);
       lastSnap = d;
+      if (newPid !== prevPid) {
+        // Focused/followed player changed — drop any in-progress tuning so the
+        // tuner reflects THIS player's saved offset (and a Save targets this
+        // player), not whatever the previous player was set to.
+        vizTuneMs = null;
+        vizUpdateTunerLabel();
+      }
       lastFetch = performance.now();
       $('dot').classList.add('live');
       // Pre-fetch the next track's lyrics so they're ready before it starts.
@@ -2485,10 +4282,17 @@ sub _pageHtml { return <<'HTML'; }
   // data, find the line whose time bracket contains the current playback
   // position, update highlight classes if it changed, smoothly scroll the
   // active line into view at roughly the upper third of the viewport.
+  // Wakes once per frame ONLY while in lyrics mode. Earlier this self-
+  // scheduled at the top regardless of mode, so the main thread woke every
+  // frame for the page's whole lifetime in every other mode too. Now the
+  // loop terminates by simply not rescheduling — setMode restarts it.
+  let lyrTickActive = false;
   function lyricsTick() {
-    requestAnimationFrame(lyricsTick);
-    if (currentMode !== 'lyrics') return;
-    if (!lyrData || !lyrData.synced || !lyrLineEls.length) return;
+    if (currentMode !== 'lyrics') { lyrTickActive = false; return; }
+    if (!lyrData || !lyrData.synced || !lyrLineEls.length) {
+      requestAnimationFrame(lyricsTick);
+      return;
+    }
 
     const pos   = currentPlayPosition();
     const lines = lyrData.lines;
@@ -2500,7 +4304,7 @@ sub _pageHtml { return <<'HTML'; }
       if (lines[i].t <= pos) idx = i; else break;
     }
 
-    if (idx === lyrActiveIndex) return;
+    if (idx !== lyrActiveIndex) {
 
     // Update classes only for the lines whose state changed: the old
     // active and the new active. Bulk reassignment would cause CSS
@@ -2528,8 +4332,18 @@ sub _pageHtml { return <<'HTML'; }
     }
 
     lyrActiveIndex = idx;
+    } // close if (idx !== lyrActiveIndex)
+
+    // Reschedule only while still in lyrics mode. Outside it the loop ends
+    // and the main thread gets that frame back. setMode → 'lyrics' restarts.
+    requestAnimationFrame(lyricsTick);
   }
-  requestAnimationFrame(lyricsTick);
+  function startLyricsTickIfNeeded() {
+    if (currentMode === 'lyrics' && !lyrTickActive) {
+      lyrTickActive = true;
+      requestAnimationFrame(lyricsTick);
+    }
+  }
 
   // Tiny diagnostic surface so the console can inspect what the IIFE is
   // doing. Useful for ad-hoc bug hunts when something looks wrong.
@@ -2567,6 +4381,24 @@ sub _pageHtml { return <<'HTML'; }
         hasSource:   !!vizSource,
         analyserMaxDb: amax,
         analyserSample: asample,
+        bass: (typeof vizRingBass !== 'undefined') ? vizRingBass : null,
+        bassNow: (function(){
+          try {
+            if (!vizAnalyser || !vizData) return null;
+            const binHz = (vizCtx ? vizCtx.sampleRate : 44100) / 2 / vizData.length;
+            const kLo = Math.max(1, Math.floor(50 / binHz));
+            const kHi = Math.min(vizData.length - 1, Math.floor(70 / binHz));
+            let kPeak = 0;
+            for (let b = kLo; b <= kHi; b++) {
+              const db = vizData[b];
+              if (db > -120) {
+                const lin = Math.pow(10, db / 20);
+                if (lin > kPeak) kPeak = lin;
+              }
+            }
+            return { rawPeak: kPeak, scaled: Math.min(1, kPeak * 80), binRange: [kLo, kHi] };
+          } catch(e) { return 'err:' + e.message; }
+        })(),
         el: el ? {
           crossOrigin: el.crossOrigin,
           src:         (el.src || '').slice(0, 70),
@@ -2581,6 +4413,21 @@ sub _pageHtml { return <<'HTML'; }
         streamUrl:   (vizStreamUrl || '').slice(0, 70),
       };
     },
+    server:    () => ({
+      isServerMode:  vizIsServerMode(),
+      cfgServerMode: VIZ_CFG && VIZ_CFG.serverMode,
+      cfgBridgeUrl:  VIZ_CFG && VIZ_CFG.bridgeUrl,
+      resolvedUrl:   vizBridgeUrl(),
+      urlOverride:   VIZ_SERVER_OVERRIDE,
+      ws:            vizWs ? { readyState: vizWs.readyState, url: vizWs.url } : null,
+      haveFrame:     !!vizServerFrame,
+      frameLen:      vizServerFrame ? vizServerFrame.length : 0,
+      frameSampleDb: vizServerFrame ? Array.from(vizServerFrame.slice(0, 6)).map(v => +v.toFixed(1)) : null,
+      sampleRate:    vizServerRate,
+      binHz:         vizServerBinHz,
+      vizActive:     vizActive,
+      mode:          currentMode,
+    }),
     state:     () => ({
       mode:                currentMode,
       player:              currentPlayer,
@@ -2637,9 +4484,14 @@ sub _pageHtml { return <<'HTML'; }
     if (body) body.scrollTop = 0;
   }
 
+  // Wakes once per frame ONLY while in biography mode. Same fix as
+  // lyricsTick: previously self-scheduled at the top in every mode.
+  let bioFrameActive = false;
   function bioScrollFrame(now) {
+    if (currentMode !== 'biography') { bioFrameActive = false; bioLastTs = now; return; }
+    // Reschedule before doing the work so we never miss a frame to early
+    // returns within the body.
     requestAnimationFrame(bioScrollFrame);
-    if (currentMode !== 'biography') { bioLastTs = now; return; }
 
     const body = $('bio-body');
     if (!body || body.classList.contains('bio-empty')) { bioLastTs = now; return; }
@@ -2684,7 +4536,12 @@ sub _pageHtml { return <<'HTML'; }
     bioLastTs = now;
   }
 
-  requestAnimationFrame(bioScrollFrame);
+  function startBioFrameIfNeeded() {
+    if (currentMode === 'biography' && !bioFrameActive) {
+      bioFrameActive = true;
+      requestAnimationFrame(bioScrollFrame);
+    }
+  }
 
   // Direct taps/clicks on the bio area also pause — not just scrolling.
   // Position-comparison catches scroll changes; this catches the case
@@ -2713,14 +4570,29 @@ sub _pageHtml { return <<'HTML'; }
   }
 
   // Smooth progress between server polls (now-playing only).
+  // tick fires every 100 ms — the rendered second only changes 10× less
+  // often than that, and the fill bar's percentage change is also coarse, so
+  // skip the DOM write when neither has changed. Cheap, but a layout/paint
+  // each tick on a wall tablet adds up.
+  let lastTickCur = '';
+  let lastTickPctInt = -1;
   function tick() {
     if (currentMode !== 'now-playing') return;
     if (!lastSnap || lastSnap.state !== 'playing') return;
     const elapsed = (performance.now() - lastFetch) / 1000;
     const pos = Math.min((lastSnap.position || 0) + elapsed, lastSnap.duration || 0);
-    $('np-cur').textContent = fmt(pos);
+    const cur = fmt(pos);
+    if (cur !== lastTickCur) {
+      $('np-cur').textContent = cur;
+      lastTickCur = cur;
+    }
     const pct = lastSnap.duration ? (pos / lastSnap.duration) * 100 : 0;
-    $('np-fill').style.width = pct + '%';
+    // Round to 0.1% — bar can't render finer than that on any realistic display.
+    const pctInt = Math.round(pct * 10);
+    if (pctInt !== lastTickPctInt) {
+      $('np-fill').style.width = (pctInt / 10) + '%';
+      lastTickPctInt = pctInt;
+    }
   }
 
   // Ambient clock.
@@ -2858,6 +4730,120 @@ sub _pageHtml { return <<'HTML'; }
   let vizGestureArmed = false;
   const vizAudio = () => document.getElementById('viz-audio');
 
+  // --------------------------------------------------------------------------
+  // Server-side analysis mode (opt-in)
+  // --------------------------------------------------------------------------
+  // When enabled, audio is analysed on the server (SqueezeLite -v -> CAVA ->
+  // vizbridge WebSocket) and the browser receives band values directly. We
+  // bypass the Web Audio API entirely, which means it works in Safari, iOS, and
+  // smart-TV browsers that can't analyse via createMediaElementSource.
+  //
+  // Enabled when:
+  //   ?server=1 in the URL  (testing override), OR
+  //   VIZ_CFG.serverMode is true AND VIZ_CFG.bridgeUrl is set
+  const VIZ_SERVER_OVERRIDE = (location.search.indexOf('server=1') !== -1);
+  function vizIsServerMode() {
+    if (VIZ_SERVER_OVERRIDE) return true;
+    return !!(VIZ_CFG && VIZ_CFG.serverMode && VIZ_CFG.bridgeUrl);
+  }
+  function vizBridgeUrl() {
+    // URL override needs a configured bridgeUrl to know where to connect;
+    // fall back to same-host port 8770 if testing without one.
+    const cfg = (VIZ_CFG && VIZ_CFG.bridgeUrl) || '';
+    if (cfg) return cfg;
+    if (VIZ_SERVER_OVERRIDE) return 'ws://' + location.hostname + ':8770/';
+    return '';
+  }
+
+  // Latest FFT bin frame (dB values) from the server. Sample rate and bin
+  // width are carried in each frame so the page can do correct frequency
+  // mapping (handles sample-rate changes between tracks).
+  //
+  // The frames are buffered with arrival timestamps so the sync offset can
+  // be applied as a true visual delay: vizDraw() picks the buffered frame
+  // closest to (now - offsetMs) each animation frame, rather than always
+  // rendering the most recent one. Without this, the offset only has an
+  // effect on browser-audio mode (where it shifts the local audio element)
+  // and does nothing in server-only mode — the ±10/±50 tuner buttons would
+  // change the saved value but no visible shift happened.
+  let vizServerFrame = null;       // Float32Array — dB-per-bin (post-buffer-pick)
+  let vizServerWave  = null;       // Float32Array — time-domain samples (post-buffer-pick)
+  let vizServerRate  = 44100;
+  let vizServerBinHz = 0;
+  // Server-mode FFT frames are now offset-adjusted by the helper itself
+  // (it reads from a time-shifted position in its Python ring buffer based
+  // on the current offset file value). What arrives here over the WebSocket
+  // is already "the audio from N ms ago", so we just store the latest one
+  // and render. No client-side buffering / picking required.
+  let vizWs = null;
+  let vizWsRetryT = null;
+  function vizServerConnect() {
+    const url = vizBridgeUrl();
+    if (!url) { vizHint('Server-side mode is on but no bridge URL configured'); return; }
+    try {
+      vizWs = new WebSocket(url);
+    } catch (e) {
+      vizHint('Could not open visualizer bridge: ' + e.message);
+      return;
+    }
+    vizWs.onopen = () => { vizHint(''); };
+    vizWs.onmessage = (ev) => {
+      // vizfft frame format: "<sr>;<binhz>;<db0>;<db1>;...;<dbN>|<w0>;<w1>;...;<wM>"
+      //  - sr     : sample rate (int)
+      //  - binhz  : Hz width of each downsampled FFT bin (float)
+      //  - db..   : dB-per-bin values, like getFloatFrequencyData() would give.
+      //  - |w..   : time-domain samples, in [-1, 1] like getFloatTimeDomainData
+      //             would give. Optional — older helpers don't include this and
+      //             Scope/Ring fall back to no data in server mode.
+      // Browser then runs the SAME band-binning/dB/tilt/ballistics as the
+      // Web Audio path, so the look matches.
+      const splitAt = ev.data.indexOf('|');
+      const freqText = splitAt >= 0 ? ev.data.slice(0, splitAt) : ev.data;
+      const waveText = splitAt >= 0 ? ev.data.slice(splitAt + 1) : '';
+
+      const parts = freqText.split(';');
+      if (parts.length < 4) return;
+      const sr = parseInt(parts[0], 10);
+      const binhz = parseFloat(parts[1]);
+      if (!sr || !binhz) return;
+      const n = parts.length - 2;
+      if (!vizServerFrame || vizServerFrame.length !== n) {
+        vizServerFrame = new Float32Array(n);
+      }
+      for (let i = 0; i < n; i++) {
+        const v = parseFloat(parts[i + 2]);
+        vizServerFrame[i] = isNaN(v) ? -120 : v;
+      }
+      vizServerRate = sr;
+      vizServerBinHz = binhz;
+      if (waveText) {
+        const wparts = waveText.split(';');
+        const m = wparts.length;
+        if (!vizServerWave || vizServerWave.length !== m) {
+          vizServerWave = new Float32Array(m);
+        }
+        for (let i = 0; i < m; i++) {
+          const v = parseFloat(wparts[i]);
+          vizServerWave[i] = isNaN(v) ? 0 : v;
+        }
+      } else {
+        vizServerWave = null;
+      }
+    };
+    vizWs.onclose = () => {
+      // Auto-retry with backoff so a server restart heals.
+      vizWs = null;
+      if (vizWsRetryT) return;
+      vizWsRetryT = setTimeout(() => { vizWsRetryT = null; vizServerConnect(); }, 2000);
+    };
+    vizWs.onerror = () => { /* close will follow; retry there */ };
+  }
+
+  function vizServerDisconnect() {
+    if (vizWs) { try { vizWs.close(); } catch (e) {} vizWs = null; }
+    if (vizWsRetryT) { clearTimeout(vizWsRetryT); vizWsRetryT = null; }
+  }
+
   let vizGain = null;
   function vizBuildGraph() {
     if (vizCtx) return;
@@ -2889,6 +4875,25 @@ sub _pageHtml { return <<'HTML'; }
 
   function vizStart() {
     if (!VIZ_ENABLED) return;
+    // Server-side analysis mode: skip Web Audio entirely, open the WebSocket.
+    // iOS / Safari / TV browsers all work in this mode since they never touch
+    // the broken createMediaElementSource path.
+    if (vizIsServerMode()) {
+      vizActive = true;
+      const hint = document.getElementById('viz-hint');
+      if (hint) { hint.textContent = 'Connecting to server visualizer\u2026'; hint.style.opacity = '1'; }
+      if (VIZ_CFG && VIZ_CFG.smoothing) vizApplySmoothing(VIZ_CFG.smoothing);
+      vizServerConnect();
+      vizSizeCanvas();
+      vizWireTuner();      // Style button / arrow keys — were missing in server mode
+      if (VIZ_CFG && VIZ_CFG.style && VIZ_STYLES.indexOf(VIZ_CFG.style) >= 0 && !vizStyleTouched) {
+        vizStyle = VIZ_CFG.style;
+      }
+      vizUpdateStyleLabel();
+      vizShowTuner();
+      if (!vizRAF) vizRAF = requestAnimationFrame(vizDraw);
+      return;
+    }
     // iOS Safari bypasses the Web Audio graph and plays the element straight
     // to the speakers (no silent analysis possible), so the visualizer is not
     // supported there. Show a message instead of ever playing audio aloud.
@@ -2947,6 +4952,7 @@ sub _pageHtml { return <<'HTML'; }
     if (el) { try { el.pause(); el.playbackRate = 1.0; } catch(e){} el.removeAttribute('src'); el.load(); }
     vizTrackId = null;
     if (vizCtx && vizCtx.state === 'running') vizCtx.suspend().catch(()=>{});
+    vizServerDisconnect();
   }
 
   // Called every poll while in visualizer mode. Rather than continuously
@@ -2956,6 +4962,9 @@ sub _pageHtml { return <<'HTML'; }
   // smoothly between them. These are exactly the moments sync was being lost.
   function vizSync(d) {
     if (!vizActive || !d) return;
+    // Server mode: nothing to sync locally — the audio is being decoded on the
+    // server by the headless Visualizer player and the bridge sends bands.
+    if (vizIsServerMode()) return;
     const el = vizAudio();
     if (!el) return;
     const tid = d.track_id;
@@ -2984,12 +4993,16 @@ sub _pageHtml { return <<'HTML'; }
             vizStreamUrl = su;
             const myTid = String(tid);
             const needsProxy = !!(j && j.needsProxy);
+            const proxySig = (j && j.sig) || '';
             // The server tells us, by source protocol, whether this stream is
             // CORS-blocked and must go through our same-origin proxy. Qobuz
             // plays direct (CORS-friendly); Bandcamp/RP use the proxy. This is
-            // deterministic — no runtime timing/error guessing.
+            // deterministic — no runtime timing/error guessing. The proxy is
+            // HMAC-gated: only URLs the server itself issued (with a matching
+            // signature) will be relayed — prevents the endpoint from being
+            // used as an open SSRF proxy.
             const loadSrc = needsProxy
-              ? `${BASE}/plugins/NowPlayingDisplay/streamproxy?url=${encodeURIComponent(su)}`
+              ? `${BASE}/plugins/NowPlayingDisplay/streamproxy?url=${encodeURIComponent(su)}&sig=${encodeURIComponent(proxySig)}`
               : su;
 
             const cleanup = () => {
@@ -3136,10 +5149,10 @@ sub _pageHtml { return <<'HTML'; }
     if (Math.abs(el.currentTime - target) > 0.5) vizSeekTo(target);
   }
 
-  // Visualizer offset resolution. Config injected from settings holds named
-  // presets and a per-player preset assignment, plus a default. We resolve the
-  // offset for whichever player this display is showing, so different rooms /
-  // display devices can each have their own dialled-in delay.
+  // Visualizer offset resolution. Config injected from settings holds a
+  // per-player offset map plus a global default. We resolve the offset for
+  // whichever player this display is showing, so each room / display device
+  // keeps its own dialled-in delay.
   let VIZ_CFG = __NPD_VIZ_CFG__;
   // Live tuning override (ms). When the user nudges the on-screen tuner this
   // holds the working value and takes precedence over the resolved config, so
@@ -3151,10 +5164,9 @@ sub _pageHtml { return <<'HTML'; }
     let ms = (VIZ_CFG && VIZ_CFG.default != null) ? Number(VIZ_CFG.default) : 0;
     try {
       const pid = (lastSnap && lastSnap.player && lastSnap.player.id) || currentPlayer || '';
-      const presetName = VIZ_CFG && VIZ_CFG.playerMap && VIZ_CFG.playerMap[pid];
-      if (presetName && VIZ_CFG.presets) {
-        const p = VIZ_CFG.presets.find(x => x.name === presetName);
-        if (p && p.ms != null && !isNaN(Number(p.ms))) ms = Number(p.ms);
+      const po = VIZ_CFG && VIZ_CFG.playerOffsets;
+      if (po && pid && po[pid] != null && !isNaN(Number(po[pid]))) {
+        ms = Number(po[pid]);
       }
     } catch (e) {}
     if (isNaN(ms)) ms = 0;
@@ -3210,7 +5222,11 @@ sub _pageHtml { return <<'HTML'; }
 
   function vizUpdateTunerLabel() {
     const lbl = document.getElementById('viz-tms');
-    if (lbl) lbl.textContent = (vizTuneMs > 0 ? '+' : '') + vizTuneMs;
+    if (!lbl) return;
+    // When not actively tuning (vizTuneMs null), show the offset resolved for
+    // the CURRENT player, not a stale number. When tuning, show the working value.
+    const v = (vizTuneMs === null) ? vizCurrentOffsetMs() : vizTuneMs;
+    lbl.textContent = (v > 0 ? '+' : '') + v;
   }
 
   function vizNudge(delta) {
@@ -3218,15 +5234,32 @@ sub _pageHtml { return <<'HTML'; }
     vizTuneMs = Math.max(-2000, Math.min(2000, vizTuneMs + delta));
     vizUpdateTunerLabel();
     vizShowTuner();
-    // Instant re-seek so the shift is visible immediately against the music.
+    // Browser-audio mode: re-seek the local audio element so the shift is
+    // visible immediately against the music. (No-op if the element isn't
+    // playing — e.g. server-mode pages or iOS Safari.)
     const el = vizAudio();
     if (el && el.readyState >= 2 && vizTrackId !== null) {
       vizSeekTo(vizEstimatedRoomPos() + vizTuneMs / 1000);
     }
+    // Server mode: push the new offset to the helper via the plugin's
+    // transient-offset endpoint. The helper polls its offset file every
+    // 100ms; next frame uses the new value. Doesn't persist — only Save
+    // does that (via vizSaveOffset, which hits /setoffset).
+    fetch(`${BASE}/plugins/NowPlayingDisplay/setlivenoffset?ms=${vizTuneMs}`,
+          { method: 'GET', cache: 'no-store' }).catch(() => {});
   }
 
-  const VIZ_STYLES = ['segmented', 'scope', 'starburst', 'bokeh'];
-  const VIZ_STYLE_NAMES = { segmented: 'Bars', scope: 'Scope', starburst: 'Starburst', bokeh: 'Bokeh' };
+  let VIZ_STYLES = ['segmented', 'scope', 'ring', 'ringVivid', 'ringZoom', 'ringClassic', 'starburst', 'bokeh'];
+  // All styles work in both web-audio and server modes now: server mode sends
+  // time-domain samples alongside the FFT bins, so Scope and the Ring variants
+  // have what they need. (Earlier versions stripped these from server mode
+  // because the helper only sent bands.)
+  const VIZ_STYLE_NAMES = {
+    segmented: 'Bars', scope: 'Scope',
+    ring: 'Waveform Ring', ringVivid: 'Waveform Ring · Vivid',
+    ringZoom: 'Waveform Ring · Zoom', ringClassic: 'Waveform Ring · Classic',
+    starburst: 'Starburst', bokeh: 'Orbs'
+  };
   function vizUpdateStyleLabel() {
     const b = document.getElementById('viz-tstyle');
     if (b) b.textContent = VIZ_STYLE_NAMES[vizStyle] || 'Style';
@@ -3243,18 +5276,148 @@ sub _pageHtml { return <<'HTML'; }
 
   function vizSaveOffset() {
     if (vizTuneMs === null) return;
-    fetch(`${BASE}/plugins/NowPlayingDisplay/setoffset?ms=${vizTuneMs}`)
+    // Save for the room currently being displayed/followed, so the offset is
+    // remembered per-player (not as the global default). Same player resolution
+    // the calibration + lead-time code use.
+    const pid = (lastSnap && lastSnap.player && lastSnap.player.id) || currentPlayer || '';
+    const u = `${BASE}/plugins/NowPlayingDisplay/setoffset?ms=${vizTuneMs}`
+            + (pid && pid !== 'auto' ? `&player=${encodeURIComponent(pid)}` : '');
+    fetch(u)
       .then(r => r.json())
-      .then(() => {
+      .then((res) => {
         const s = document.getElementById('viz-tsaved');
         if (s) { s.hidden = false; setTimeout(() => { s.hidden = true; }, 1500); }
-        // Fold the saved value into the config default so it persists as the
-        // resolved offset and we can clear the live override.
-        if (VIZ_CFG) VIZ_CFG.default = vizTuneMs;
+        // Reflect the save immediately so the tuner baseline is right before
+        // the next state.json poll refreshes VIZ_CFG. Per-player saves update
+        // the offset map; the no-player fallback updates the global default.
+        if (VIZ_CFG && res && res.scope === 'player' && res.playerId) {
+          VIZ_CFG.playerOffsets = VIZ_CFG.playerOffsets || {};
+          VIZ_CFG.playerOffsets[res.playerId] = vizTuneMs;
+        } else if (VIZ_CFG) {
+          VIZ_CFG.default = vizTuneMs;
+        }
       })
       .catch(() => {});
   }
 
+  // ===== Calibration tones ===================================================
+  // Plays a looping calibration tone (1 kHz or 200 Hz click train) through
+  // the currently-displayed room so the user can use the existing ±10/±50
+  // tuner buttons to align the visualizer bars to the audible clicks, then
+  // tap Save as normal. The tone plays via LMS's standard playlist
+  // mechanism — no UI lockout, no separate measurement loop, no modal:
+  // the visualizer keeps rendering normally throughout.
+  //
+  // The /calibrate endpoint sends the player a "playlist play file://..."
+  // with repeat-track on, so the 16-second WAV loops until we send a stop.
+  // A long safety-stop timer (10 min) catches the case where the browser
+  // tab is closed without explicitly stopping.
+
+  let calActiveTone = null;     // '1khz' | '200hz' | null
+  let calActivePlayerId = null; // player MAC the tone is playing on
+  let calSafetyTimer = 0;
+
+  // --- Calibration animation state (the "ball drops on a moving block" A/V
+  // sync view). It detects each 1Hz beep in the incoming (offset-DELAYED)
+  // captured audio and fires the impact on that detected instant, so as you
+  // change the offset the impact slides relative to the beep you hear from the
+  // room. You tune until the ball strikes / the screen flashes exactly when you
+  // hear the beep — that's the room's offset.
+  let calLastOnset  = 0;        // performance.now() of last detected beep
+  let calPeriod     = 1000;     // ms between beeps (EMA; tone is 1Hz)
+  let calArmed      = true;     // hysteresis: ready to detect next rising edge
+  let calFlashUntil = 0;        // impact flash decays until this time
+  let calSwap       = false;    // ball/block colour swap toggle (per impact)
+  let calOnsetCount = 0;        // beeps seen since calibration started
+  function vizCalReset() {
+    calLastOnset = 0; calPeriod = 1000; calArmed = true;
+    calFlashUntil = 0; calSwap = false; calOnsetCount = 0;
+  }
+
+  function vizCalPlayerId() {
+    // Resolve the player to calibrate against. Prefer the actively-playing
+    // room from the most recent state snapshot (so "Auto" mode works);
+    // fall back to the explicitly-selected player.
+    let pid = (lastSnap && lastSnap.player && lastSnap.player.id) || null;
+    if (!pid && currentPlayer && currentPlayer !== 'auto') pid = currentPlayer;
+    return pid;
+  }
+
+  function vizCalToggle(tone) {
+    // If this tone is already playing on a player, treat the tap as STOP.
+    if (calActiveTone === tone && calActivePlayerId) {
+      vizCalStop();
+      return;
+    }
+    // If a DIFFERENT tone is playing, stop it first.
+    if (calActiveTone && calActivePlayerId) {
+      vizCalStop(true);   // silent: don't update tuner, we're about to restart
+    }
+    const pid = vizCalPlayerId();
+    if (!pid) {
+      // Brief flash on the tuner — no popup, no UI lockout.
+      vizShowTuner();
+      const sav = document.getElementById('viz-tsaved');
+      if (sav) { sav.textContent = 'No active player'; sav.hidden = false; setTimeout(() => { sav.hidden = true; sav.textContent = 'Saved'; }, 1800); }
+      return;
+    }
+    const url = BASE + '/plugins/NowPlayingDisplay/calibrate?action=start&tone='
+              + encodeURIComponent(tone) + '&player=' + encodeURIComponent(pid);
+    fetch(url, { method: 'GET', cache: 'no-store' })
+      .then(r => r.json())
+      .then(j => {
+        if (!j.ok) {
+          const sav = document.getElementById('viz-tsaved');
+          if (sav) { sav.textContent = 'Cal failed: ' + (j.error || 'error'); sav.hidden = false; setTimeout(() => { sav.hidden = true; sav.textContent = 'Saved'; }, 2500); }
+          return;
+        }
+        calActiveTone = tone;
+        calActivePlayerId = pid;
+        vizCalReset();           // clear any stale beat phase from a prior run
+        vizCalUpdateButtons();
+        // Safety stop: 10 minutes is plenty for any tuning session and
+        // catches the "user walked away with tone still playing" case.
+        clearTimeout(calSafetyTimer);
+        calSafetyTimer = setTimeout(() => { vizCalStop(); }, 600000);
+        vizShowTuner();
+      })
+      .catch(() => {});
+  }
+
+  function vizCalStop(silent) {
+    clearTimeout(calSafetyTimer);
+    calSafetyTimer = 0;
+    const pid = calActivePlayerId;
+    calActiveTone = null;
+    calActivePlayerId = null;
+    vizCalUpdateButtons();
+    if (!pid) return;
+    fetch(BASE + '/plugins/NowPlayingDisplay/calibrate?action=stop&player=' + encodeURIComponent(pid),
+          { method: 'GET', cache: 'no-store' }).catch(() => {});
+  }
+
+  function vizCalUpdateButtons() {
+    const b1 = document.getElementById('viz-tcal1k');
+    const b2 = document.getElementById('viz-tcal200');
+    if (b1) {
+      b1.classList.toggle('active', calActiveTone === '1khz');
+      b1.textContent = (calActiveTone === '1khz') ? '■ 1k' : '♪ 1k';
+    }
+    if (b2) {
+      b2.classList.toggle('active', calActiveTone === '200hz');
+      b2.textContent = (calActiveTone === '200hz') ? '■ 200' : '♪ 200';
+    }
+  }
+
+  // Make sure a playing tone is stopped if the user navigates away.
+  window.addEventListener('beforeunload', () => {
+    if (calActiveTone) vizCalStop();
+  });
+
+    // Mirror the currently-displayed room's playback onto the dedicated
+  // Visualizer player so the server-side FFT analyses what we're listening
+  // to. The plugin's vizmirror endpoint has safety guards — it will only
+  // ever command the player at the configured Visualizer-player MAC.
   function vizWireTuner() {
     if (vizTunerWired) return;
     vizTunerWired = true;
@@ -3265,6 +5428,8 @@ sub _pageHtml { return <<'HTML'; }
     bind('viz-plus50',  () => vizNudge(50));
     bind('viz-tsave',   vizSaveOffset);
     bind('viz-tstyle',  vizCycleStyle);
+    bind('viz-tcal1k',  () => vizCalToggle('1khz'));
+    bind('viz-tcal200', () => vizCalToggle('200hz'));
     // Tap anywhere in the visualizer reveals the tuner.
     const sec = document.querySelector('.mode.visualizer');
     if (sec) sec.addEventListener('pointerdown', (e) => {
@@ -3331,32 +5496,171 @@ sub _pageHtml { return <<'HTML'; }
     }
   }
 
+  // Detect a beep onset in the current captured frame and render the
+  // calibration view. Returns nothing; called from vizDraw while a tone runs.
+  // Onset = the visualizer SEEING the beep (in the offset-delayed stream), so
+  // the impact is genuinely tied to the offset.
+  function vizDrawCalibration(W, H) {
+    const now = performance.now();
+
+    // --- Beep-onset detection from the captured audio ---
+    // Prefer the time-domain wave (clean: ~0 between beeps, strong during).
+    // Fall back to peak band energy if no wave is present.
+    let level = 0;
+    if (vizServerWave && vizServerWave.length) {
+      let s = 0;
+      for (let i = 0; i < vizServerWave.length; i++) s += vizServerWave[i] * vizServerWave[i];
+      level = Math.sqrt(s / vizServerWave.length);          // RMS, ~0..0.4
+    } else if (vizServerFrame && vizServerFrame.length) {
+      let mx = -200;
+      for (let i = 0; i < vizServerFrame.length; i++) if (vizServerFrame[i] > mx) mx = vizServerFrame[i];
+      level = Math.max(0, (mx + 80) / 80);                  // crude dB->0..1
+    }
+    const ON = 0.06, OFF = 0.03;                            // hysteresis thresholds
+    const REFRACTORY = 450;                                 // ms; beeps are ~1000ms apart
+    if (calArmed && level > ON && (now - calLastOnset) > REFRACTORY) {
+      if (calLastOnset > 0) {
+        const dt = now - calLastOnset;
+        if (dt > 600 && dt < 1600) calPeriod += (dt - calPeriod) * 0.3;   // EMA toward true 1Hz
+      }
+      calLastOnset = now;
+      calFlashUntil = now + 150;     // crisp impact flash
+      calSwap = !calSwap;
+      calOnsetCount++;
+      calArmed = false;
+    } else if (!calArmed && level < OFF) {
+      calArmed = true;               // re-arm once the beep has died away
+    }
+
+    // --- Geometry ---
+    const cx = W * 0.5;
+    const floorY = H * 0.72;
+    const ballR = Math.max(10, H * 0.045);
+    const COL_BALL = '#4fb0d0';      // theme cyan
+    const COL_BLOCK = '#e8943a';     // orange
+    const ballCol  = calSwap ? COL_BLOCK : COL_BALL;
+    const blockCol = calSwap ? COL_BALL  : COL_BLOCK;
+
+    // Predicted next impact (phase-locked to detected beeps). Until we've seen
+    // the first beep, just park the ball at the top.
+    const haveLock = calOnsetCount > 0;
+    const nextImpact = calLastOnset + calPeriod;
+
+    // Block slides left->right, passing through centre exactly at impact.
+    const blockW = Math.max(60, W * 0.10), blockH = Math.max(18, H * 0.03);
+    const span = W * 0.5;
+    let blockCx = cx;
+    if (haveLock) {
+      const speed = (span * 2) / calPeriod;                 // px/ms across 2*span per period
+      blockCx = cx + ((now - nextImpact) * speed);
+      // wrap into [cx-span, cx+span]
+      const range = span * 2;
+      blockCx = cx - span + (((blockCx - (cx - span)) % range) + range) % range;
+    }
+
+    // Ball bounces continuously: it strikes the floor exactly at each impact,
+    // rising back up in between — one smooth down-up cycle per beep, never
+    // teleporting. Phase 0 and 1 are both at the floor (impact); phase 0.5 is
+    // the apex. We use the time since the last impact, wrapped by the period.
+    let ballY = H * 0.12;
+    if (haveLock) {
+      const apexY = H * 0.10;
+      const restY = floorY - ballR;
+      // phase: 0 at last impact, climbs to 1 at next impact
+      let ph = (now - calLastOnset) / calPeriod;
+      ph = ((ph % 1) + 1) % 1;
+      // Symmetric path: floor -> apex -> floor. Ease so it slows at the top
+      // (gravity) and meets the floor crisply at both ends.
+      const u = 1 - Math.abs(2 * ph - 1);        // 0 at floor, 1 at apex, 0 at floor
+      const eased = Math.sin((u * Math.PI) / 2); // slow at apex, fast near floor
+      ballY = restY + (apexY - restY) * eased;
+    }
+
+    const flashing = now < calFlashUntil;
+    const flashK = flashing ? Math.max(0, (calFlashUntil - now) / 150) : 0;
+
+    // --- Draw ---
+    // Floor line
+    vizG.strokeStyle = 'rgba(255,255,255,0.35)';
+    vizG.lineWidth = Math.max(2, H * 0.004);
+    vizG.beginPath(); vizG.moveTo(0, floorY); vizG.lineTo(W, floorY); vizG.stroke();
+
+    // Big flash circle, lower-left, fires on impact
+    const fr = H * 0.14;
+    vizG.beginPath();
+    vizG.arc(W * 0.13, floorY, fr, 0, Math.PI * 2);
+    vizG.fillStyle = flashing ? `rgba(255,255,255,${0.85 * flashK})` : 'rgba(255,255,255,0.06)';
+    vizG.fill();
+
+    // Moving block on the floor
+    vizG.fillStyle = blockCol;
+    vizG.fillRect(blockCx - blockW / 2, floorY - blockH, blockW, blockH);
+
+    // Ball
+    vizG.beginPath();
+    vizG.arc(cx, ballY, ballR, 0, Math.PI * 2);
+    vizG.fillStyle = ballCol;
+    vizG.fill();
+
+    // Full-screen impact wash (brief)
+    if (flashing) {
+      vizG.fillStyle = `rgba(255,255,255,${0.18 * flashK})`;
+      vizG.fillRect(0, 0, W, H);
+    }
+
+    // Status text
+    vizG.fillStyle = 'rgba(255,255,255,0.6)';
+    vizG.font = `${Math.max(12, H * 0.022)}px system-ui, sans-serif`;
+    vizG.textAlign = 'center';
+    const msg = haveLock
+      ? 'Tune the offset until the flash lands on the beep you hear'
+      : 'Waiting for calibration tone\u2026';
+    vizG.fillText(msg, cx, H * 0.94);
+    vizG.textAlign = 'start';
+  }
+
   function vizDraw() {
     if (!vizActive) { vizRAF = 0; return; }
     vizRAF = requestAnimationFrame(vizDraw);
-    if (!vizG || !vizAnalyser) return;
+    if (!vizG) return;
+
+    const serverMode = vizIsServerMode();
+    // Browser-audio mode requires the analyser to be live; server mode renders
+    // from the WebSocket-supplied band values and has no analyser/context.
+    if (!serverMode && !vizAnalyser) return;
 
     // If the AudioContext is still suspended (browsers start it that way until
-    // a user gesture), keep trying to resume every frame.
-    if (vizCtx && vizCtx.state === 'suspended') {
-      vizResume();
-      vizHint('Tap to start the visualizer');
-    } else if (vizCtx && vizCtx.state === 'running' && vizHintIsStart) {
-      vizHint('');   // clear the start hint once running
+    // a user gesture), keep trying to resume every frame. Only meaningful in
+    // browser-audio mode — server mode has no AudioContext.
+    if (!serverMode) {
+      if (vizCtx && vizCtx.state === 'suspended') {
+        vizResume();
+        vizHint('Tap to start the visualizer');
+      } else if (vizCtx && vizCtx.state === 'running' && vizHintIsStart) {
+        vizHint('');   // clear the start hint once running
+      }
+      vizCorrect();   // keep audio position locked to room + offset
     }
-
-    vizCorrect();   // keep audio position locked to room + offset
 
     const W = vizCanvas.width, H = vizCanvas.height;
     vizG.clearRect(0, 0, W, H);
     vizG.fillStyle = '#000';
     vizG.fillRect(0, 0, W, H);
 
+    // While a calibration tone is running, take over the whole screen with the
+    // ball/block A/V-sync view — no bars, so there's a single fixed instant
+    // (the impact/flash) to align the beep against.
+    if (calActiveTone) { vizDrawCalibration(W, H); return; }
+
     // Dispatch to the active style. All styles share the same audio plumbing;
     // they differ only in how they render the analysed data.
     if (vizStyle === 'starburst')   vizDrawStarburst(W, H);
     else if (vizStyle === 'bokeh')  vizDrawBokeh(W, H);
     else if (vizStyle === 'scope')  vizDrawScope(W, H);
+    else if (vizStyle === 'ring')        vizDrawWaveRing(W, H, 'pulse');
+    else if (vizStyle === 'ringVivid')   vizDrawWaveRing(W, H, 'vivid');
+    else if (vizStyle === 'ringZoom')    vizDrawWaveRing(W, H, 'zoom');
+    else if (vizStyle === 'ringClassic') vizDrawWaveRingClassic(W, H);
     else                            vizDrawSegmented(W, H);
   }
 
@@ -3374,12 +5678,79 @@ sub _pageHtml { return <<'HTML'; }
   function vizComputeBands() {
     const now = performance.now();
     const dt = now - vizLastCompute;
-    if (dt < VIZ_UPDATE_MS && vizLevels) return VIZ_BARS;
+    if (dt < VIZ_UPDATE_MS && vizLevels) return (vizLevels ? vizLevels.length : VIZ_BARS);
     vizLastCompute = now;
+
+    // SERVER MODE: bin data comes from our own FFT helper (npd-vizfft.py)
+    // as dB-per-bin values, like getFloatFrequencyData() would give. We run
+    // THE SAME log-binning + tilt + dB-curve + ballistics as the browser-
+    // audio path below, with the same constants — so the look matches the
+    // original Bars exactly. Only the data source differs.
+    if (vizIsServerMode()) {
+      const bars = VIZ_BARS;
+      if (!vizLevels || vizLevels.length !== bars) vizLevels = new Float32Array(bars);
+      if (!vizPeaks  || vizPeaks.length  !== bars) vizPeaks  = new Float32Array(bars);
+      const f = vizServerFrame;
+      if (!f || f.length === 0 || !vizServerBinHz) return bars;
+
+      const fscale = Math.min(4, dt / 16.7);
+      const aRate = 1 - Math.pow(1 - VIZ_ATTACK, fscale);
+      const dRate = 1 - Math.pow(1 - VIZ_DECAY,  fscale);
+      const peakDrop = VIZ_PEAK_DECAY * fscale;
+
+      const bins   = f.length;
+      const hzPer  = vizServerBinHz;       // Hz width per downsampled FFT bin
+      const fMin   = 50;
+      const nyq    = vizServerRate / 2;
+      const fMax   = Math.min(20000, nyq);
+      const logMin = Math.log10(fMin);
+      const logMax = Math.log10(fMax);
+      const span   = VIZ_DB_CEIL - VIZ_DB_FLOOR;
+      // Our FFT helper's dB values (observed ~ -30..-55 during music) already
+      // sit nicely within our -73..-10 floor/ceiling, so no offset is needed.
+      // Kept as a tunable: raise if bars globally too short, lower if too tall.
+      const SRV_DB_OFFSET = 0;
+
+      for (let i = 0; i < bars; i++) {
+        const f0 = Math.pow(10, logMin + (i     / bars) * (logMax - logMin));
+        const f1 = Math.pow(10, logMin + ((i+1) / bars) * (logMax - logMin));
+        let b0 = Math.floor(f0 / hzPer);
+        let b1 = Math.max(b0 + 1, Math.ceil(f1 / hzPer));
+        if (b1 > bins) b1 = bins;
+        // Average power across the bins in this band (NOT averaging dB).
+        let power = 0, nb = 0;
+        for (let b = b0; b < b1; b++) {
+          const dbv = f[b];
+          if (dbv <= -120) continue;     // helper's floor; treat as silent
+          power += Math.pow(10, dbv / 10);
+          nb++;
+        }
+        const avgPower = nb > 0 ? power / nb : 0;
+        let bandDb = avgPower > 0 ? 10 * Math.log10(avgPower) + SRV_DB_OFFSET : -Infinity;
+
+        // Spectral tilt — same as browser-audio path.
+        const fc = Math.sqrt(f0 * f1);
+        const octFromCentre = Math.log2(fc / VIZ_TILT_PIVOT_HZ);
+        bandDb += VIZ_TILT_DB_PER_OCT * octFromCentre;
+
+        let target = (bandDb - VIZ_DB_FLOOR) / span;
+        if (!isFinite(target) || target < 0) target = 0;
+        if (target > 1) target = 1;
+        const cur = vizLevels[i];
+        const rate = (target > cur) ? aRate : dRate;
+        const v = cur + (target - cur) * rate;
+        vizLevels[i] = v;
+        if (v >= vizPeaks[i]) vizPeaks[i] = v;
+        else vizPeaks[i] = Math.max(v, vizPeaks[i] - peakDrop);
+      }
+      return bars;
+    }
+
     // Scale factor relative to a 60fps frame (16.7ms). Clamp so a long stall
     // (e.g. tab backgrounded) can't produce a huge jump.
     const fscale = Math.min(4, dt / 16.7);
     vizAnalyser.getFloatFrequencyData(vizData);
+
     const bins   = vizData.length;
     const nyq    = (vizCtx ? vizCtx.sampleRate : 44100) / 2;
     const hzPer  = nyq / bins;
@@ -3565,8 +5936,9 @@ sub _pageHtml { return <<'HTML'; }
   let vizBurstAngle = 0;
   let vizBurstPhase = 0;
   let vizBurstHue = 0;               // slow palette drift over time (0..1)
+  let vizBurstLastT = 0;             // last frame timestamp for dt-scaled motion
   const VIZ_BURST_SUBDIV = 3;        // wedges per band (20 bands -> 60 wedges)
-  const VIZ_BURST_SPIN   = 0.022;    // rotation per update (higher = faster)
+  const VIZ_BURST_SPIN   = 0.011;    // rotation per 60fps-frame (time-scaled)
   const VIZ_BURST_FADESPEED = 0.06;  // how fast the transparency pattern drifts
   const VIZ_BURST_HUE_CYCLES = 3;    // times the colour gradient repeats around the disc
   const VIZ_BURST_HUE_DRIFT  = 0.003;// slow palette shift per update
@@ -3588,10 +5960,27 @@ sub _pageHtml { return <<'HTML'; }
     const wedges = bars * VIZ_BURST_SUBDIV;
     const slice = (Math.PI * 2) / wedges;
 
-    vizBurstAngle += VIZ_BURST_SPIN;
-    if (vizBurstAngle > Math.PI * 2) vizBurstAngle -= Math.PI * 2;
-    vizBurstPhase += VIZ_BURST_FADESPEED;
-    vizBurstHue = (vizBurstHue + VIZ_BURST_HUE_DRIFT) % 1;
+    // Time-scale the animation so it advances by real elapsed time, not a fixed
+    // amount per frame. Per-frame increments make the rotation visibly jitter
+    // whenever frame timing varies (and amplify it on the long back layer). A
+    // dt-scaled step keeps the spin/drift speed constant regardless of frame
+    // rate or hitches — the same principle the ballistics use.
+    const nowT = performance.now();
+    if (!vizBurstLastT) vizBurstLastT = nowT;
+    let burstDt = (nowT - vizBurstLastT) / 16.7;   // in 60fps-frame units
+    vizBurstLastT = nowT;
+    if (!isFinite(burstDt) || burstDt <= 0) burstDt = 1;
+    if (burstDt > 4) burstDt = 4;                  // clamp after a stall
+
+    vizBurstAngle += VIZ_BURST_SPIN * burstDt;
+    // NOTE: deliberately NOT wrapping vizBurstAngle at 2π. The layers rotate at
+    // vizBurstAngle * lay.spin (spin = 1.0, -0.6, 1.7). Subtracting 2π from the
+    // base angle is seamless only for the spin=1.0 layer; for the others it
+    // jumps by (2π * spin) mod 2π — e.g. the front layer (1.7) snapped forward
+    // ~0.7 of a turn every wrap (~every several seconds). That was the glitch.
+    // sin/cos handle large angles fine, so we just let it grow.
+    vizBurstPhase += VIZ_BURST_FADESPEED * burstDt;
+    vizBurstHue = (vizBurstHue + VIZ_BURST_HUE_DRIFT * burstDt) % 1;
 
     const span = (VIZ_HUE_HIGH - VIZ_HUE_LOW);
 
@@ -3610,7 +5999,12 @@ sub _pageHtml { return <<'HTML'; }
         const v1 = vizLevels[(bi + 1) % bars];
         const v = v0 + (v1 - v0) * frac;
 
-        const len = v * maxLen * lay.scale;   // from the very centre (no core)
+        // Minimum length so the gradient start/end are never coincident. A
+        // degenerate createLinearGradient (start ≈ end, when a band is near
+        // silent) renders unpredictably — which made quiet wedges, and whole
+        // quiet layers, flicker/vanish for a frame. Flooring len keeps every
+        // gradient valid.
+        const len = Math.max(2, v * maxLen * lay.scale);
         const a0 = w * slice;
         const a1 = a0 + slice * 0.82;
 
@@ -3638,8 +6032,16 @@ sub _pageHtml { return <<'HTML'; }
         vizG.lineTo(Math.cos(a1) * len, Math.sin(a1) * len);
         vizG.closePath();
         vizG.fillStyle = grad;
-        vizG.shadowBlur = (6 + v * 18) * (L === VIZ_BURST_LAYERS.length - 1 ? 1 : 0.4);
-        vizG.shadowColor = `hsla(${hue + 12}, 100%, 70%, ${0.2 + v * 0.35})`;
+        // shadowBlur is one of the most expensive canvas ops; doing it on every
+        // wedge of every layer was a major per-frame cost and a source of frame
+        // drops / jitter (worst on the long back layer). Restrict it to the
+        // front layer only, where the glow actually reads.
+        if (L === VIZ_BURST_LAYERS.length - 1) {
+          vizG.shadowBlur = 6 + v * 18;
+          vizG.shadowColor = `hsla(${hue + 12}, 100%, 70%, ${0.2 + v * 0.35})`;
+        } else {
+          vizG.shadowBlur = 0;
+        }
         vizG.fill();
       }
       vizG.globalAlpha = 1;
@@ -3693,12 +6095,33 @@ sub _pageHtml { return <<'HTML'; }
     }
   }
 
+  // Populate `vizWave` from whichever source the active mode provides:
+  //   web-audio mode: pull fresh time-domain samples from the analyser
+  //   server mode:    use the most recent wave block sent by the FFT helper
+  // Returns true on success (vizWave is usable), false if no data is available.
+  // Centralised so Scope and the four Ring variants stay simple and don't each
+  // need their own mode dispatch.
+  function vizPopulateWave() {
+    if (vizIsServerMode()) {
+      if (!vizServerWave) return false;
+      // Reallocate vizWave to match the server's wave length the first time we
+      // see it. Same-shape Float32Array thereafter, copied in by index — cheap.
+      if (!vizWave || vizWave.length !== vizServerWave.length) {
+        vizWave = new Float32Array(vizServerWave.length);
+      }
+      vizWave.set(vizServerWave);
+      return true;
+    }
+    if (!vizWave || !vizAnalyser) return false;
+    vizAnalyser.getFloatTimeDomainData(vizWave);
+    return true;
+  }
+
   // ----- Style 3: oscilloscope waveform -----
   // Draws the actual time-domain waveform as a flowing line. Uses a hue sweep
   // along the x-axis for a bit of colour.
   function vizDrawScope(W, H) {
-    if (!vizWave) return;
-    vizAnalyser.getFloatTimeDomainData(vizWave);
+    if (!vizPopulateWave()) return;
     const n = vizWave.length;
     const mid = H / 2;
     const amp = H * 0.40;
@@ -3716,6 +6139,209 @@ sub _pageHtml { return <<'HTML'; }
     }
     vizG.strokeStyle = 'hsl(190, 90%, 60%)';
     vizG.stroke();
+  }
+
+  // ----- Style: Waveform Ring -----
+  // Time-domain waveform wrapped around a circle: angle = time, amplitude
+  // pushes in/out from a base radius. Silent = clean circle; audio = wobble.
+  //
+  // Colour: a CONIC gradient with just TWO hues. Three stops only — hue A at
+  // 0, hue B at 0.5, hue A again at 1 (closing the wrap). That's exactly two
+  // zones around the ring with smooth transitions between. The two hues
+  // slowly advance through the full 360° hue wheel together, wrapping
+  // seamlessly so the zones drift through every colour over ~40s.
+  //
+  // Music reactivity: bass energy (50–120 Hz, the kick range) drives the
+  // brightness, saturation, line thickness and glow size — continuously,
+  // not just on detected beats. Louder bass = brighter, fatter, glowier.
+  let vizRingAngle = 0;
+  let vizRingLastT = 0;
+  let vizRingColorPhase = 0;
+  let vizRingGradAngle = 0;
+  let vizRingBass = 0;                  // smoothed kick-band energy 0..1
+  const VIZ_RING_SPIN        = 0.004;
+  const VIZ_RING_COLOR_SPEED = 0.0006;  // hue cycle: slower (~80s per full wheel)
+  const VIZ_RING_GRAD_SPIN   = 0.001;   // gradient rotation: slower
+  // Per-mode config for the three reactive ring variants.
+  //   pulse: current default (v0.30.8.0) — modest defocus, dramatic sat pulse
+  //   vivid: less defocus, more saturation push
+  //   zoom:  same as vivid but shows a fraction of the waveform around the
+  //          ring (zoomed in) so peaks/dips read larger
+  const VIZ_RING_MODES = {
+    pulse: { blurBase: 0.002, blurBass: 0.025, bloomBlurBase: 0.020, bloomBlurBass: 0.025,
+             satBase: 60, satBoost: 40, zoom: 1.00 },
+    vivid: { blurBase: 0.001, blurBass: 0.015, bloomBlurBase: 0.010, bloomBlurBass: 0.015,
+             satBase: 55, satBoost: 45, zoom: 1.00 },
+    zoom:  { blurBase: 0.001, blurBass: 0.015, bloomBlurBase: 0.010, bloomBlurBass: 0.015,
+             satBase: 55, satBoost: 45, zoom: 0.40 },
+  };
+  function vizDrawWaveRing(W, H, mode) {
+    const cfg = VIZ_RING_MODES[mode] || VIZ_RING_MODES.pulse;
+    if (!vizPopulateWave()) return;
+    const n = vizWave.length;
+    const cx = W / 2, cy = H / 2;
+    const minDim = Math.min(W, H);
+    const baseR = minDim * 0.26;
+    const amp   = minDim * 0.17;
+
+    // Time-scaled animation.
+    const nowT = performance.now();
+    if (!vizRingLastT) vizRingLastT = nowT;
+    let rdt = (nowT - vizRingLastT) / 16.7;
+    vizRingLastT = nowT;
+    if (!isFinite(rdt) || rdt <= 0) rdt = 1;
+    if (rdt > 4) rdt = 4;
+    vizRingAngle     += VIZ_RING_SPIN * rdt;
+    vizRingColorPhase = (vizRingColorPhase + VIZ_RING_COLOR_SPEED * rdt) % 1;
+    vizRingGradAngle += VIZ_RING_GRAD_SPIN * rdt;
+
+    // --- Kick-drum energy in the lowest spectrum band (~50-70 Hz) ---
+    // Matches the lowest bar in the Bars visualizer (which covers roughly
+    // 50-67 Hz with the 20-bar log binning from 50 Hz). Narrow band = highly
+    // selective — only deep kick fundamentals trigger it, not broader bass.
+    //
+    // Source-agnostic: in web-audio mode we refresh vizData via the analyser
+    // and read its bins; in server mode the same shape of data already arrived
+    // over the WebSocket in vizServerFrame. Either way it's a dB-per-bin array,
+    // so the kick-finding logic is identical once we've picked the source.
+    let dbBins = null, binHz = 0;
+    if (vizIsServerMode()) {
+      if (vizServerFrame && vizServerBinHz) {
+        dbBins = vizServerFrame;
+        binHz  = vizServerBinHz;
+      }
+    } else if (vizData && vizAnalyser) {
+      vizAnalyser.getFloatFrequencyData(vizData);
+      dbBins = vizData;
+      binHz  = (vizCtx ? vizCtx.sampleRate : 44100) / 2 / vizData.length;
+    }
+    if (dbBins && binHz) {
+      const kLo = Math.max(1, Math.floor(50 / binHz));
+      const kHi = Math.min(dbBins.length - 1, Math.floor(70 / binHz));
+      let kPeak = 0;
+      for (let b = kLo; b <= kHi; b++) {
+        const db = dbBins[b];
+        if (db > -120) {
+          const lin = Math.pow(10, db / 20);
+          if (lin > kPeak) kPeak = lin;
+        }
+      }
+      const kickNow = Math.min(1, kPeak * 80);
+      // Snappy envelope: fast attack so a kick spikes immediately, FAST decay
+      // so the value returns to baseline quickly (within ~5 frames, ~80ms).
+      // The slow-decay approach kept everything "pulsed" most of the time;
+      // we want short, distinct pulses with calm resting state between.
+      if (kickNow > vizRingBass) vizRingBass = vizRingBass * 0.2 + kickNow * 0.8;
+      else                       vizRingBass = vizRingBass * 0.70 + kickNow * 0.30;
+    }
+    const bass = vizRingBass;
+
+    // --- Build the waveform path ---
+    // Zoomed waveform: instead of wrapping all `n` samples around the full
+    // circle, wrap only the most-recent fraction (cfg.zoom) — so each sample
+    // gets more angular space and peaks/dips read larger. zoom=1.0 = full
+    // waveform (default for pulse/vivid); zoom=0.4 shows only ~40% of the
+    // samples, magnifying the visible detail.
+    const visibleN = Math.max(64, Math.floor(n * cfg.zoom));
+    const points = Math.min(visibleN, 1440);
+    const step = visibleN / points;
+    const startOffset = n - visibleN;     // start at most-recent samples
+    const lwBase = Math.max(2.5, minDim * 0.005);
+    vizG.lineWidth = lwBase * (1 + bass * 0.6);     // thicker on bass
+    vizG.lineJoin = 'round';
+    vizG.beginPath();
+    for (let p = 0; p <= points; p++) {
+      const i = Math.min(n - 1, startOffset + Math.floor(p * step));
+      const frac = p / points;
+      const ang = vizRingAngle + frac * Math.PI * 2;
+      const r = baseR + vizWave[i] * amp;
+      const px = cx + Math.cos(ang) * r;
+      const py = cy + Math.sin(ang) * r;
+      if (p === 0) vizG.moveTo(px, py);
+      else vizG.lineTo(px, py);
+    }
+    vizG.closePath();
+
+    // --- Conic two-zone gradient — ONLY 3 stops so there's no rainbow ---
+    // hueA at start, hueB at half-way, hueA at end (wraps). That's it.
+    // Anything more creates intermediate colour bands.
+    const hueA = (vizRingColorPhase * 360) % 360;
+    const hueB = (hueA + 180) % 360;
+    const sat  = cfg.satBase + bass * cfg.satBoost;
+    const lit  = 48 + bass * 17;
+
+    const grad = vizG.createConicGradient(vizRingGradAngle, cx, cy);
+    grad.addColorStop(0,   `hsl(${hueA}, ${sat}%, ${lit}%)`);
+    grad.addColorStop(0.5, `hsl(${hueB}, ${sat}%, ${lit}%)`);
+    grad.addColorStop(1,   `hsl(${hueA}, ${sat}%, ${lit}%)`);
+    vizG.strokeStyle = grad;
+
+    // --- Glow ---
+    vizG.shadowBlur  = minDim * (cfg.blurBase + bass * cfg.blurBass);
+    const glowHue = (hueA + hueB) / 2;
+    vizG.shadowColor = `hsla(${glowHue}, 100%, ${65 + bass * 25}%, ${0.1 + bass * 0.55})`;
+    vizG.stroke();
+
+    // --- Bloom on real kicks ---
+    if (bass > 0.4) {
+      const bloom = (bass - 0.4) / 0.6;
+      vizG.lineWidth = lwBase * (1.5 + bloom * 2.5);
+      vizG.globalAlpha = bloom * 0.35;
+      vizG.shadowBlur = minDim * (cfg.bloomBlurBase + bloom * cfg.bloomBlurBass);
+      vizG.stroke();
+      vizG.globalAlpha = 1;
+    }
+    vizG.shadowBlur = 0;
+  }
+
+  // ----- Style: Waveform Ring (Classic) -----
+  // The original calm version — static cyan→blue→violet gradient, gentle
+  // glow, no music reactivity. The waveform-on-a-circle without the kick
+  // pulse / colour cycling / dramatic effects of the other ring variants.
+  function vizDrawWaveRingClassic(W, H) {
+    if (!vizPopulateWave()) return;
+    const n = vizWave.length;
+    const cx = W / 2, cy = H / 2;
+    const minDim = Math.min(W, H);
+    const baseR = minDim * 0.26;
+    const amp   = minDim * 0.17;
+
+    // Time-scaled slow rotation (reuses the shared ring state).
+    const nowT = performance.now();
+    if (!vizRingLastT) vizRingLastT = nowT;
+    let rdt = (nowT - vizRingLastT) / 16.7;
+    vizRingLastT = nowT;
+    if (!isFinite(rdt) || rdt <= 0) rdt = 1;
+    if (rdt > 4) rdt = 4;
+    vizRingAngle += VIZ_RING_SPIN * rdt;
+
+    const points = Math.min(n, 1440);
+    const step = n / points;
+
+    vizG.lineWidth = Math.max(2, minDim * 0.004);
+    vizG.lineJoin = 'round';
+    vizG.beginPath();
+    for (let p = 0; p <= points; p++) {
+      const i = Math.min(n - 1, Math.floor(p * step));
+      const frac = p / points;
+      const ang = vizRingAngle + frac * Math.PI * 2;
+      const r = baseR + vizWave[i] * amp;
+      const px = cx + Math.cos(ang) * r;
+      const py = cy + Math.sin(ang) * r;
+      if (p === 0) vizG.moveTo(px, py);
+      else vizG.lineTo(px, py);
+    }
+    vizG.closePath();
+
+    const grad = vizG.createLinearGradient(cx - baseR, cy - baseR, cx + baseR, cy + baseR);
+    grad.addColorStop(0,   'hsl(190, 90%, 62%)');
+    grad.addColorStop(0.5, 'hsl(210, 85%, 60%)');
+    grad.addColorStop(1,   'hsl(265, 80%, 64%)');
+    vizG.strokeStyle = grad;
+    vizG.shadowBlur = minDim * 0.012;
+    vizG.shadowColor = 'hsla(200, 100%, 70%, 0.5)';
+    vizG.stroke();
+    vizG.shadowBlur = 0;
   }
 
   // ----- Boot -----

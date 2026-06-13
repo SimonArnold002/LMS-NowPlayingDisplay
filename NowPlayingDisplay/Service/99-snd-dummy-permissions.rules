@@ -1,0 +1,17 @@
+# Make the snd-dummy virtual sound card accessible to non-audio-group users.
+# This file (under /etc/udev/rules.d/) loosens permissions only on the Dummy
+# ALSA card — not on any real audio hardware — so the LMS user (squeezeboxserver)
+# can spawn squeezelite against the Dummy card without being in the audio group.
+#
+# The Dummy card is a virtual device created by the snd-dummy kernel module.
+# It has no real-world security implications (nothing is recorded, nothing is
+# played), so opening it up to all users is safe and avoids needing to modify
+# user group memberships.
+#
+# Drop in /etc/udev/rules.d/, then:
+#     sudo udevadm control --reload
+#     sudo udevadm trigger
+# After that, the Dummy card's /dev/snd/* nodes are accessible to all users.
+
+KERNEL=="controlC[0-9]*", SUBSYSTEM=="sound", ATTRS{id}=="Dummy", MODE="0666"
+KERNEL=="pcmC[0-9]*", SUBSYSTEM=="sound", ATTRS{id}=="Dummy", MODE="0666"

@@ -20,7 +20,7 @@ PLUGIN_NOWPLAYINGDISPLAY_PLAYER_URLS
 	EN	Per-player URLs
 
 PLUGIN_NOWPLAYINGDISPLAY_PLAYER_URLS_DESC
-	EN	Per-player URLs. Bookmark one of these on a specific device (e.g. a kitchen tablet) to lock that display to a single player.
+	EN	Per-player URLs and sync offsets. Bookmark a URL on a specific device (e.g. a kitchen tablet) to lock that display to one player. The offset is that player's visualizer sync delay in ms — set it here, or just tune it live on the display with the on-screen Save button. Leave blank to use the default below.
 
 PLUGIN_NOWPLAYINGDISPLAY_DISPLAY
 	EN	Display
@@ -77,7 +77,7 @@ PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY
 	EN	Default visualizer sync offset (ms)
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY_DESC
-	EN	Fallback offset used when a player has no preset assigned. Positive pushes the visualization earlier (use if it lags the sound), negative later. Range -2000 to 2000. Note: very low bass naturally resolves a little later than treble in any FFT analyzer — that part isn't corrected by this offset.
+	EN	Fallback offset used when a player has no per-player offset set above. Positive pushes the visualization earlier (use if it lags the sound), negative later. Range -2000 to 2000. Note: very low bass naturally resolves a little later than treble in any FFT analyzer — that part isn't corrected by this offset.
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS
 	EN	Visualizer delay presets
@@ -130,9 +130,68 @@ PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RAD
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SCOPE
 	EN	Oscilloscope (waveform line)
 
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING
+	EN	Waveform Ring (kick-reactive, modest glow)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_VIVID
+	EN	Waveform Ring · Vivid (kick-reactive, more saturation, less defocus)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_ZOOM
+	EN	Waveform Ring · Zoom (Vivid, with waveform zoomed in)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_CLASSIC
+	EN	Waveform Ring · Classic (original calm cyan→violet, no music reactivity)
+
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_STAR
 	EN	Starburst (radial wedges from centre)
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_BOKEH
-	EN	Bokeh (soft drifting orbs of light)
+	EN	Orbs (soft drifting orbs of light)
 
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER
+	EN	Server-side audio analysis (experimental)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_DESC
+	EN	Analyse the audio on the server (via a headless SqueezeLite + CAVA + WebSocket bridge) and render the visualizer from the server's band data, bypassing the Web Audio API. This is what allows the visualizer to work in Safari, iOS, and smart-TV browsers (which can't analyse audio reliably client-side). Requires the bridge helper to be running. Leave OFF for normal Chrome/Edge use.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_ENABLE
+	EN	Use server-side analysis when a bridge URL is configured
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_URL_DESC
+	EN	WebSocket URL of the running visualizer bridge (e.g. ws://lms-host:8770/). Used by the page to receive band data. The display device must be able to reach this URL.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PLAYER_MAC_DESC
+	EN	MAC address of the dedicated headless Visualizer SqueezeLite player (the one started with -m &lt;mac&gt; -v). This is the ONLY player the plugin will command in server-side mode — a strict safety guard prevents commands ever reaching real listening players.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_AUTOFOLLOW
+	EN	Auto-follow the room (mirror)
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_AUTOFOLLOW_DESC
+	EN	On (default): the plugin mirrors the active/selected room onto the Visualizer player. Turn OFF only to experiment with native LMS sync grouping — when off the plugin sends no playlist/seek commands to the Visualizer, so you can manually sync it into a room's group (as a follower) without the mirror collapsing the shared queue. The Visualizer player and FFT helper keep running, so audio capture still works.
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_AUTORUN
+	EN	Auto-start bundled FFT helper when server mode is on
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_AUTORUN_DESC
+	EN	The plugin can manage the bundled Python FFT helper (Bin/npd-vizfft.py) directly — spawning it when server mode is enabled, restarting it if it dies, and stopping it when server mode is turned off. Disable only if you run the helper externally yourself (e.g. as a separate service).
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SQZ_AUTORUN
+	EN	Auto-start dedicated Visualizer SqueezeLite when server mode is on
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SQZ_AUTORUN_DESC
+	EN	The plugin can also manage the dedicated headless SqueezeLite instance that feeds the FFT helper via shared memory. Same lifecycle as the helper. Disable only if you already run it externally (e.g. as a systemd unit you wrote yourself).
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_START
+	EN	Start
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_STOP
+	EN	Stop
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_RESTART
+	EN	Restart
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_RECHECK
+	EN	Re-check dependencies
+
+PLUGIN_NOWPLAYINGDISPLAY_VIZ_SETUP_INSTRUCTIONS
+	EN	Show one-time system setup (snd-dummy + Dummy-card permissions)

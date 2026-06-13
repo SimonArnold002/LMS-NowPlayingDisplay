@@ -37,12 +37,8 @@
           </td>
           <td style="vertical-align: middle; padding: 3px 0 3px 10px; white-space: nowrap;">
             <span style="color:#888; font-size:0.85em;">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PLAYER_OFFSET" | string %]</span>
-            <select name="assign_[% p.id %]" class="stdedit">
-              <option value="">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_NONE" | string %]</option>
-              [% FOREACH pr IN vizPresets %]
-                <option value="[% pr.name | html %]" [% p.assigned == pr.name ? "selected" : "" %]>[% pr.name | html %] ([% pr.ms %] ms)</option>
-              [% END %]
-            </select>
+            <input type="text" name="offset_[% p.id %]" class="stdedit" size="6"
+                   value="[% p.offset %]" placeholder="[% prefs.vizDelayMs %]" /> ms
           </td>
         </tr>
         [% END %]
@@ -81,29 +77,6 @@
     [% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_LABEL" | string %]
   [% END %]
 
-  [% WRAPPER settingGroup title="PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS"
-                          desc="PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS_DESC" %]
-    <table>
-      <tr>
-        <th style="text-align:left; font-size:0.85em; color:#888;">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_NAME" | string %]</th>
-        <th style="text-align:left; font-size:0.85em; color:#888; padding-left:10px;">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESET_MS" | string %]</th>
-      </tr>
-      [% FOREACH i IN [ 0, 1, 2, 3, 4, 5 ] %]
-        [% preset = vizPresets.$i %]
-        <tr>
-          <td style="padding:2px 0;">
-            <input type="text" name="preset_name_[% i %]" class="stdedit" size="24"
-                   value="[% preset.name | html %]" placeholder="e.g. Lounge Sonos" />
-          </td>
-          <td style="padding:2px 0 2px 10px;">
-            <input type="text" name="preset_ms_[% i %]" class="stdedit" size="6"
-                   value="[% preset.ms %]" /> ms
-          </td>
-        </tr>
-      [% END %]
-    </table>
-  [% END %]
-
   [% WRAPPER settingGroup title="PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY"
                           desc="PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY_DESC" %]
     <input type="text" name="pref_vizDelayMs" id="vizDelayMs" class="stdedit" size="6" value="[% prefs.vizDelayMs %]" />
@@ -125,9 +98,136 @@
     <select name="pref_vizStyle" id="vizStyle" class="stdedit">
       <option [% prefs.vizStyle == "segmented" ? "selected" : "" %] value="segmented">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SEG" | string %]</option>
       <option [% prefs.vizStyle == "scope"     ? "selected" : "" %] value="scope">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_SCOPE" | string %]</option>
+      <option [% prefs.vizStyle == "ring"      ? "selected" : "" %] value="ring">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING" | string %]</option>
+      <option [% prefs.vizStyle == "ringVivid"  ? "selected" : "" %] value="ringVivid">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_VIVID" | string %]</option>
+      <option [% prefs.vizStyle == "ringZoom"   ? "selected" : "" %] value="ringZoom">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_ZOOM" | string %]</option>
+      <option [% prefs.vizStyle == "ringClassic" ? "selected" : "" %] value="ringClassic">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_RING_CLASSIC" | string %]</option>
       <option [% prefs.vizStyle == "starburst" ? "selected" : "" %] value="starburst">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_STAR" | string %]</option>
       <option [% prefs.vizStyle == "bokeh"     ? "selected" : "" %] value="bokeh">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_BOKEH" | string %]</option>
     </select>
+  [% END %]
+
+  [% WRAPPER settingGroup title="PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER"
+                          desc="PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_DESC" %]
+    <label>
+      <input type="checkbox" name="pref_vizServerMode" value="1" [% prefs.vizServerMode ? "checked" : "" %]>
+      [% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_ENABLE" | string %]
+    </label>
+    <br><br>
+    <input type="text" name="pref_vizBridgeUrl" id="vizBridgeUrl" class="stdedit" size="48"
+           value="[% prefs.vizBridgeUrl | html %]"
+           placeholder="ws://lms-host:8770/">
+    <span class="prefDesc">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_URL_DESC" | string %]</span>
+    <br><br>
+    <input type="text" name="pref_vizPlayerMac" id="vizPlayerMac" class="stdedit" size="24"
+           value="[% prefs.vizPlayerMac | html %]"
+           placeholder="aa:bb:cc:dd:ee:ff">
+    <span class="prefDesc">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PLAYER_MAC_DESC" | string %]</span>
+
+    <br><br>
+    <label>
+      <input type="checkbox" name="pref_vizAutoFollow" value="1" [% prefs.vizAutoFollow ? "checked" : "" %]>
+      [% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_AUTOFOLLOW" | string %]
+    </label>
+    <span class="prefDesc">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_AUTOFOLLOW_DESC" | string %]</span>
+
+    <hr style="margin:14px 0;">
+
+    <!-- SqueezeLite process -->
+    <label>
+      <input type="checkbox" name="pref_vizSqueezeliteEnabled" value="1" [% prefs.vizSqueezeliteEnabled ? "checked" : "" %]>
+      [% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_SQZ_AUTORUN" | string %]
+    </label>
+    <span class="prefDesc">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_SQZ_AUTORUN_DESC" | string %]</span>
+    <div id="npd-sqz-status" style="font-family:monospace;background:#222;color:#eee;padding:10px;border-radius:4px;font-size:12px;line-height:1.5;margin-top:8px;">
+      <strong>Visualizer SqueezeLite:</strong>
+      [% IF sqzStatus.running %]
+        <span style="color:#7f7;">running (PID [% sqzStatus.pid %])</span>
+      [% ELSE %]
+        <span style="color:#f77;">stopped</span>
+      [% END %]
+      <br>
+      <strong>Binary:</strong> [% IF sqzStatus.binary %][% sqzStatus.binary | html %][% ELSE %]<span style="color:#f77;">squeezelite not found in PATH (install with: sudo apt install squeezelite)</span>[% END %]
+      <br>
+      <strong>Dummy ALSA card:</strong>
+      [% IF sqzStatus.dummyLoaded %]
+        <span style="color:#7f7;">loaded</span>
+      [% ELSE %]
+        <span style="color:#f77;">not loaded — run <code>sudo modprobe snd-dummy</code> (and see one-time setup below for boot-persistence)</span>
+      [% END %]
+      <br>
+      <strong>Log:</strong> [% sqzStatus.logPath | html %]
+      &nbsp;[<a href="/plugins/NowPlayingDisplay/squeezelite?action=log" target="_blank">view recent</a>]
+    </div>
+    <div style="margin-top:6px;">
+      <button type="button" onclick="npdProcAction('squeezelite', 'start')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_START" | string %]</button>
+      <button type="button" onclick="npdProcAction('squeezelite', 'stop')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_STOP" | string %]</button>
+      <button type="button" onclick="npdProcAction('squeezelite', 'restart')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_RESTART" | string %]</button>
+    </div>
+
+    <hr style="margin:14px 0;">
+
+    <!-- Helper process -->
+    <label>
+      <input type="checkbox" name="pref_vizHelperEnabled" value="1" [% prefs.vizHelperEnabled ? "checked" : "" %]>
+      [% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_AUTORUN" | string %]
+    </label>
+    <span class="prefDesc">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_AUTORUN_DESC" | string %]</span>
+    <div id="npd-helper-status" style="font-family:monospace;background:#222;color:#eee;padding:10px;border-radius:4px;font-size:12px;line-height:1.5;margin-top:8px;">
+      <strong>FFT helper:</strong>
+      [% IF helperStatus.running %]
+        <span style="color:#7f7;">running (PID [% helperStatus.pid %])</span>
+      [% ELSE %]
+        <span style="color:#f77;">stopped</span>
+      [% END %]
+      &nbsp;·&nbsp; port [% helperStatus.port %]
+      <br>
+      <strong>Dependencies:</strong>
+      [% IF helperStatus.depsOk %]
+        <span style="color:#7f7;">OK</span> ([% helperStatus.pythonBin %] + numpy)
+      [% ELSE %]
+        <span style="color:#f77;">[% helperStatus.depsErr | html %]</span>
+      [% END %]
+      <br>
+      <strong>Script:</strong> [% helperStatus.scriptPath | html %]
+      <br>
+      <strong>Log:</strong> [% helperStatus.logPath | html %]
+      &nbsp;[<a href="/plugins/NowPlayingDisplay/helper?action=log" target="_blank">view recent</a>]
+    </div>
+    <div style="margin-top:6px;">
+      <button type="button" onclick="npdProcAction('helper', 'start')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_START" | string %]</button>
+      <button type="button" onclick="npdProcAction('helper', 'stop')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_STOP" | string %]</button>
+      <button type="button" onclick="npdProcAction('helper', 'restart')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PROC_RESTART" | string %]</button>
+      <button type="button" onclick="npdProcAction('helper', 'recheck-deps')">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_HELPER_RECHECK" | string %]</button>
+    </div>
+
+    <hr style="margin:14px 0;">
+    <details style="margin-top:8px;">
+      <summary style="cursor:pointer; font-weight:bold;">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_SETUP_INSTRUCTIONS" | string %]</summary>
+      <p>The plugin manages both SqueezeLite and the FFT helper directly. Two small system-level steps are needed once (both require root): load the <code>snd-dummy</code> kernel module at boot, and open the Dummy ALSA card's permissions via a udev rule so the LMS user can spawn squeezelite against it. The udev rule only affects the virtual Dummy card — no other audio hardware is touched.</p>
+      <p><strong>One-time setup (any Linux):</strong></p>
+      <pre style="background:#222;color:#eee;padding:10px;border-radius:4px;font-size:11px;overflow-x:auto;">PLUGIN=[% pluginBaseDir | html %]
+
+# 1. Make snd-dummy load at boot (it's already in every distro's stock kernel).
+sudo cp $PLUGIN/Service/snd-dummy.conf /etc/modules-load.d/snd-dummy.conf
+sudo modprobe snd-dummy
+
+# 2. Open the Dummy ALSA card's /dev/snd nodes so the LMS user can access them.
+#    Only affects the virtual Dummy card, not any real audio hardware.
+sudo cp $PLUGIN/Service/99-snd-dummy-permissions.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger
+
+# 3. Install apt deps (squeezelite + python3 + numpy) if you don't have them.
+sudo apt install -y squeezelite python3 python3-numpy   # Debian/Ubuntu/DietPi
+# sudo apk add squeezelite python3 py3-numpy            # Alpine
+# sudo pacman -S squeezelite python python-numpy        # Arch
+# sudo dnf install squeezelite python3 python3-numpy    # Fedora</pre>
+      <p>That's it — turn on "Server-side visualizer" above and the plugin handles spawning both processes.</p>
+      <p>The default config runs SqueezeLite as:</p>
+      <pre style="background:#222;color:#eee;padding:10px;border-radius:4px;font-size:11px;overflow-x:auto;">squeezelite -n Visualizer -m [% prefs.vizPlayerMac | html %] -o plughw:CARD=Dummy,DEV=0 -v -s 127.0.0.1</pre>
+      <p>Why a real SqueezeLite (and not a UPnPBridge-style approach)? UPnPBridge uses a custom fork that doesn't open ALSA — it just forwards audio to network renderers. We need the real binary because the <code>-v</code> shared-memory buffer (read by our FFT helper) is populated by SqueezeLite's audio output thread, which needs ALSA as a clocking source. The Dummy card gives us that timing without any actual sound playback. See <code>$PLUGIN/Service/README.md</code> for full notes.</p>
+    </details>
   [% END %]
 
 [% END %]
@@ -143,6 +243,59 @@
       inputs[i].value = window.location.origin + inputs[i].getAttribute('data-npd-url');
     }
   })();
+
+  // Generic helper/squeezelite action handler. The two processes have parallel
+  // endpoints (/helper and /squeezelite) so a single function with a "proc"
+  // arg keeps the page JS small. Refreshes the relevant status block from
+  // the JSON response.
+  function npdProcAction(proc, action) {
+    var section = (proc === 'squeezelite') ? document.getElementById('npd-sqz-status')
+                                            : document.getElementById('npd-helper-status');
+    if (!section) return;
+    var btns = section.parentElement.querySelectorAll('button');
+    for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
+
+    var url = '/plugins/NowPlayingDisplay/' + proc + '?action=' + encodeURIComponent(action);
+    fetch(url, { method: 'GET', cache: 'no-store' })
+      .then(function(r) { return r.json(); })
+      .then(function(j) {
+        if (proc === 'squeezelite') {
+          var runHtml = j.running
+            ? '<span style="color:#7f7;">running (PID ' + j.pid + ')</span>'
+            : '<span style="color:#f77;">stopped</span>';
+          var binHtml = j.binary
+            ? (j.binary)
+            : '<span style="color:#f77;">squeezelite not found in PATH (install with: sudo apt install squeezelite)</span>';
+          var dummyHtml = j.dummyLoaded
+            ? '<span style="color:#7f7;">loaded</span>'
+            : '<span style="color:#f77;">not loaded — run <code>sudo modprobe snd-dummy</code></span>';
+          section.innerHTML =
+              '<strong>Visualizer SqueezeLite:</strong> ' + runHtml + '<br>' +
+              '<strong>Binary:</strong> ' + binHtml + '<br>' +
+              '<strong>Dummy ALSA card:</strong> ' + dummyHtml + '<br>' +
+              '<strong>Log:</strong> ' + (j.logPath || '') +
+              ' &nbsp;[<a href="/plugins/NowPlayingDisplay/squeezelite?action=log" target="_blank">view recent</a>]';
+        } else {
+          var runHtml = j.running
+            ? '<span style="color:#7f7;">running (PID ' + j.pid + ')</span>'
+            : '<span style="color:#f77;">stopped</span>';
+          var depsHtml = j.depsOk
+            ? '<span style="color:#7f7;">OK</span> (' + (j.pythonBin || '') + ' + numpy)'
+            : '<span style="color:#f77;">' + (j.depsErr || '') + '</span>';
+          section.innerHTML =
+              '<strong>FFT helper:</strong> ' + runHtml +
+              ' &nbsp;·&nbsp; port ' + (j.port || '') + '<br>' +
+              '<strong>Dependencies:</strong> ' + depsHtml + '<br>' +
+              '<strong>Script:</strong> ' + (j.scriptPath || '') + '<br>' +
+              '<strong>Log:</strong> ' + (j.logPath || '') +
+              ' &nbsp;[<a href="/plugins/NowPlayingDisplay/helper?action=log" target="_blank">view recent</a>]';
+        }
+      })
+      .catch(function(e) { console.error('proc action failed:', e); })
+      .finally(function() {
+        for (var i = 0; i < btns.length; i++) btns[i].disabled = false;
+      });
+  }
 </script>
 
 [% PROCESS settings/footer.html %]
