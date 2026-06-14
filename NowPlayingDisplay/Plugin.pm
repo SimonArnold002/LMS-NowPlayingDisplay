@@ -3670,7 +3670,12 @@ sub _pageHtml { return <<'HTML'; }
   // wall), so iOS is fine and the visualizer should be available. This must
   // be computed BEFORE the iOS visibility gate below.
   const VIZ_CFG_PEEK = __NPD_VIZ_CFG__;
-  const VIZ_SERVER_AVAILABLE = !!(VIZ_CFG_PEEK && VIZ_CFG_PEEK.serverMode && VIZ_CFG_PEEK.bridgeUrl)
+  // Server mode is "available" whenever the admin has it on — the bridge URL is
+  // no longer required here. When the URL field is blank the page derives one
+  // (ws://<host>:8770/, see vizBridgeUrl), so leaving it empty must NOT hide the
+  // visualizer on iOS (which has no Web Audio fallback). Requiring bridgeUrl
+  // previously made "server mode on + URL blank" silently work on desktop only.
+  const VIZ_SERVER_AVAILABLE = !!(VIZ_CFG_PEEK && VIZ_CFG_PEEK.serverMode)
                               || (location.search.indexOf('server=1') !== -1);
   const VALID_MODES = ['now-playing', 'artwork', 'lyrics', 'ambient', 'vinyl', 'biography'];
   if (VIZ_ENABLED && (!VIZ_IS_IOS || VIZ_SERVER_AVAILABLE)) {
@@ -4843,14 +4848,21 @@ sub _pageHtml { return <<'HTML'; }
   const VIZ_SERVER_OVERRIDE = (location.search.indexOf('server=1') !== -1);
   function vizIsServerMode() {
     if (VIZ_SERVER_OVERRIDE) return true;
-    return !!(VIZ_CFG && VIZ_CFG.serverMode && VIZ_CFG.bridgeUrl);
+    // bridgeUrl no longer required — vizBridgeUrl() derives one when it's blank.
+    return !!(VIZ_CFG && VIZ_CFG.serverMode);
   }
   function vizBridgeUrl() {
-    // URL override needs a configured bridgeUrl to know where to connect;
-    // fall back to same-host port 8770 if testing without one.
+    // Prefer an explicitly configured bridgeUrl. Otherwise derive one from the
+    // host the page was loaded from, on the helper's default port (8770, which
+    // matches _helperPort()'s fallback when the pref is blank). Deriving means
+    // "server mode on" works even with the Bridge URL field left empty — the
+    // field is an optional override, not a requirement. The derived host always
+    // resolves because we reached this very page through it.
     const cfg = (VIZ_CFG && VIZ_CFG.bridgeUrl) || '';
     if (cfg) return cfg;
-    if (VIZ_SERVER_OVERRIDE) return 'ws://' + location.hostname + ':8770/';
+    if ((VIZ_CFG && VIZ_CFG.serverMode) || VIZ_SERVER_OVERRIDE) {
+      return 'ws://' + location.hostname + ':8770/';
+    }
     return '';
   }
 

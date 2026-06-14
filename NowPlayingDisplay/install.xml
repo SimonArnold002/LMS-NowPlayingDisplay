@@ -7,7 +7,7 @@
   </targetApplication>
   <creator>CrystalGipsy</creator>
   <email>crystalgipsy@users.noreply.github.com</email>
-  <version>0.37.11.0</version>
+  <version>0.37.12.0</version>
   <name>PLUGIN_NOWPLAYINGDISPLAY</name>
   <description>PLUGIN_NOWPLAYINGDISPLAY_DESC</description>
   <module>Plugins::NowPlayingDisplay::Plugin</module>

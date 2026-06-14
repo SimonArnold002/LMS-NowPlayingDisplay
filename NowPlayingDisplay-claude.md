@@ -1,6 +1,6 @@
 # NowPlayingDisplay — Dev Journal
 
-## Version: 0.37.11.0
+## Version: 0.37.12.0
 
 > Canonical source of truth across forked Claude sessions. Reconcile to this at the
 > start of every session. Update on request; Simon re-uploads it at session start.
@@ -8,6 +8,7 @@
 > **server mode only**; browser-audio mode is parked and locked.
 
 ### Recent version history
+- **0.37.12.0** — **bridge-URL auto-derive (iOS fix).** When `vizServerMode` is on but `vizBridgeUrl` is blank, the page now derives `ws://<page-host>:8770/` (matches `_helperPort()`'s 8770 default) instead of failing. Root cause of "visualizer works on desktop but not iOS": with a blank bridge URL, `vizIsServerMode()` returned false, so desktop silently fell back to browser Web Audio (works) while iOS — which has no Web Audio path — showed nothing. Three JS edits: `VIZ_SERVER_AVAILABLE` and `vizIsServerMode()` now require only `serverMode` (not `bridgeUrl`); `vizBridgeUrl()` derives the host:port when the field is empty. The Bridge URL field is now an optional override. Side effect: desktops with server mode on now use the server path too (consistent across clients).
 - **0.37.3.0** — helper rate-robustness (`npd-vizfft.py`): deterministic sample-rate read from the fixed vis_t offset (no loose scan / 44.1k stuck-default), plausible rates 8k–384k, ring sized for highest rate, rate-change logging.
 - **0.37.4.0** — manual-player-follow: the Visualizer follows the room manually selected on the display, not just the most-active one (`$_vizDesiredSource` set from the page's state.json poll; reconcile honours the pin).
 - **0.37.5.0** — **`vizAutoFollow` toggle** (settings checkbox "Auto-follow the room (mirror)", default on). Off = mirror issues no commands to the Visualizer, so it can sit in a native sync group for experiments while the player + helper keep running. Reconcile early-returns when off.
