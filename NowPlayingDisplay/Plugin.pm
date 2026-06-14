@@ -949,6 +949,12 @@ my %CALIBRATION_TONES = (
 # an explicit stop before the auto-stop fires.
 my %CALIBRATION_ACTIVE;
 
+# Player the visualizer mirror should follow, as chosen by the display page (or
+# pinned by calibration). Empty = auto (most-active room). Declared here because
+# the calibration handler below reads/writes it; the auto-follow code further
+# down uses the same variable.
+my $_vizDesiredSource = '';
+
 # Calibration WAV duration in seconds — keep in sync with the WAV files.
 # Plus a small grace period for the player to actually stop.
 # Calibration tone is now looped (repeat-track on) until the user explicitly
@@ -1010,6 +1016,49 @@ sub _handleCalibrationWav {
     # for an operation only run during calibration.
     $response->header('Cache-Control' => 'no-store');
     Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$body);
+}
+
+# Snapshot a player's current queue + position + transport state so calibration
+# can restore the user's music afterwards (option a). Uses the status query so
+# it's robust across LMS versions and needs no extra imports. Returns a hashref;
+# an empty urls list means the room was idle (nothing to restore).
+sub _calSnapshotPlaylist {
+    my ($client) = @_;
+    my %snap = (urls => [], index => 0, time => 0, mode => 'stop');
+    eval {
+        my $req = Slim::Control::Request->new($client->id, ['status', 0, 99999, 'tags:u']);
+        $req->execute();
+        my $loop = $req->getResult('playlist_loop') || [];
+        $snap{urls}  = [ map { $_->{url} } grep { defined $_->{url} } @$loop ];
+        my $idx = $req->getResult('playlist_cur_index');
+        my $t   = $req->getResult('time');
+        $snap{index} = (defined $idx && $idx =~ /^\d+$/)      ? $idx : 0;
+        $snap{time}  = (defined $t   && $t   =~ /^[\d.]+$/)   ? $t   : 0;
+        $snap{mode}  = $req->getResult('mode') // 'stop';
+    };
+    return \%snap;
+}
+
+# Restore a snapshot taken by _calSnapshotPlaylist: rebuild the queue, jump to
+# the track + position, and match the prior play/pause/stop state. Safe to call
+# with an empty/idle snapshot (just clears).
+sub _calRestorePlaylist {
+    my ($client, $snap) = @_;
+    return unless $client && $snap && ref($snap->{urls}) eq 'ARRAY';
+    my @urls = @{ $snap->{urls} };
+    eval { $client->execute(['playlist', 'clear']); };
+    return unless @urls;                      # room was idle — nothing to put back
+    for my $u (@urls) {
+        eval { $client->execute(['playlist', 'add', $u]); };
+    }
+    eval { $client->execute(['playlist', 'index', ($snap->{index} || 0)]); };
+    if ($snap->{time} && $snap->{time} > 0) {
+        eval { $client->execute(['time', $snap->{time}]); };
+    }
+    my $mode = $snap->{mode} // 'play';
+    if    ($mode eq 'pause') { eval { $client->execute(['pause', 1]); }; }
+    elsif ($mode eq 'stop')  { eval { $client->execute(['stop']);     }; }
+    # 'play' — the 'playlist index' above already resumed playback.
 }
 
 sub _handleCalibrate {
@@ -1084,22 +1133,44 @@ sub _handleCalibrate {
         };
         $prevRepeat = 0 unless defined $prevRepeat && $prevRepeat =~ /^\d+$/;
 
-        # Play the WAV and set repeat-track so it loops continuously.
-        # `playlist play <url>` clears the current queue and starts immediately;
-        # `playlist repeat 1` makes it loop the single track. Together: the
-        # tone plays forever until we explicitly stop it (or the safety
-        # timer fires).
-        $client->execute(['playlist', 'play', $url]);
-        $client->execute(['playlist', 'repeat', 1]);
+        # Snapshot the room's queue BEFORE we touch it, so we can put the
+        # user's music back exactly where it was when calibration stops.
+        my $snap = _calSnapshotPlaylist($client);
 
-        # Safety net: stop after a generous timeout so the room doesn't
-        # beep forever if the browser tab is closed without a stop. The
-        # closure captures both the player ID and the repeat mode to restore.
-        my $stopRef = sub { _calibrationStop($playerId, $prevRepeat); };
+        # Mark calibration active BEFORE playing anything. This makes the
+        # mirror (which we override-on below) carry the tone to the Visualizer.
+        my $stopRef = sub { _calibrationStop($playerId); };
         $CALIBRATION_ACTIVE{$playerId} = {
             stop_ref     => $stopRef,
             prev_repeat  => $prevRepeat,
+            snapshot     => $snap,
+            viz_mac      => $vizMac,
+            prev_desired => $_vizDesiredSource,   # restore the mirror pin on stop
         };
+
+        # Pin the auto-follow mirror to THIS room for the duration. The mirror
+        # then delivers the room's tone to the Visualizer through the same
+        # play+seek path as normal playback — one source, one stream path — so
+        # the offset you tune is the one that's actually correct in real use.
+        # (True sample-sync isn't possible here: every room is a bridge that
+        # won't feed a synced SqueezeLite follower — proven earlier — so the
+        # mirror path is the closest correct equivalent.)
+        $_vizDesiredSource = $playerId;
+
+        # Play the looping tone on the ROOM, so you HEAR it. Its queue is saved
+        # above and restored on stop. The Visualizer gets the tone via the
+        # mirror (see above), NOT a separate play — that's what keeps the heard
+        # beep and the seen beep on the same clock.
+        $client->execute(['playlist', 'play', $url]);
+        $client->execute(['playlist', 'repeat', 1]);
+
+        my $vizClient = $vizMac ? Slim::Player::Client::getClient($vizMac) : undef;
+        if (!$vizClient) {
+            $log->warn("[calib] no Visualizer player ($vizMac) — ball won't animate");
+        }
+
+        # Safety net: stop after a generous timeout so the room doesn't beep
+        # forever if the browser tab is closed without a stop.
         Slim::Utils::Timers::setTimer($client,
             Time::HiRes::time() + $CALIBRATION_AUTOSTOP_SECS,
             $stopRef);
@@ -1114,9 +1185,7 @@ sub _handleCalibrate {
         return;
     }
     elsif ($action eq 'stop') {
-        my $entry = $CALIBRATION_ACTIVE{$playerId};
-        my $prevRepeat = $entry ? $entry->{prev_repeat} : 0;
-        _calibrationStop($playerId, $prevRepeat);
+        _calibrationStop($playerId);
         _send($httpClient, $response, 'application/json',
               encode_json({ ok => \1, action => 'stop', player => $playerId }),
               no_cache => 1);
@@ -1145,29 +1214,55 @@ sub _handleCalibrate {
 # closes the device, power 1 reopens it clean.
 #
 # Idempotent — safe to call when no calibration is running.
+# Stop calibration on a player: release the tone on the Visualizer, put the
+# user's music back on the room, and un-suppress the mirror. Single-arg now —
+# everything else (repeat, snapshot, viz mac) comes from the active entry.
+# Idempotent — safe to call when no calibration is running.
 sub _calibrationStop {
-    my ($playerId, $prevRepeat) = @_;
+    my ($playerId) = @_;
     return unless $playerId;
+
+    my $entry      = $CALIBRATION_ACTIVE{$playerId};
+    my $prevRepeat = $entry ? $entry->{prev_repeat} : 0;
+    my $snap       = $entry ? $entry->{snapshot}    : undef;
+    my $vizMac     = $entry ? $entry->{viz_mac}     : ($prefs->get('vizPlayerMac') // '');
+
+    # Restore the mirror pin to whatever it was before calibration (so we don't
+    # leave the Visualizer locked to the calibration room).
+    if ($entry && exists $entry->{prev_desired}) {
+        $_vizDesiredSource = $entry->{prev_desired};
+    }
+
+    # 1. Stop + clear the tone on the Visualizer. Once the mirror is
+    #    un-suppressed (below) its next reconcile re-takes the Visualizer.
+    if ($vizMac) {
+        my $viz = Slim::Player::Client::getClient($vizMac);
+        if ($viz) {
+            eval { $viz->execute(['stop']); };
+            eval { $viz->execute(['playlist', 'clear']); };
+        }
+    }
+
+    # 2. Restore the ROOM. Stop the tone, power-cycle to release the file://
+    #    device handle cleanly (proven necessary on these players), restore the
+    #    repeat mode, then put the user's queue + position + transport back.
     my $client = Slim::Player::Client::getClient($playerId);
     if ($client) {
-        $log->info("[calib] stop player=$playerId restore-repeat=" . ($prevRepeat // '?'));
-        # 1. Stop playback and clear our looping WAV from the queue.
+        $log->info("[calib] stop player=$playerId restore-repeat=" . ($prevRepeat // '?')
+                   . " tracks=" . ($snap ? scalar(@{$snap->{urls} || []}) : 0));
         eval { $client->execute(['stop']); };
         eval { $client->execute(['playlist', 'clear']); };
-        # 2. Power-cycle the player to fully release the audio device. Without
-        #    this, the file:// stream can stay in a half-open state with the
-        #    device handle held — symptom is subsequent tracks failing to
-        #    play or appearing to skip immediately. The 0→1 sequence is
-        #    instantaneous from the user's perspective; no audible click.
         eval { $client->execute(['power', 0]); };
         eval { $client->execute(['power', 1]); };
-        # 3. Restore the repeat mode we changed at start time (if we changed it).
         if (defined $prevRepeat && $prevRepeat =~ /^\d+$/) {
             eval { $client->execute(['playlist', 'repeat', $prevRepeat]); };
         }
+        _calRestorePlaylist($client, $snap) if $snap;
     }
-    if (my $entry = delete $CALIBRATION_ACTIVE{$playerId}) {
-        eval { Slim::Utils::Timers::killTimers(undef, $entry->{stop_ref}); };
+
+    # 3. Removing the entry un-suppresses the mirror.
+    if (my $e = delete $CALIBRATION_ACTIVE{$playerId}) {
+        eval { Slim::Utils::Timers::killTimers(undef, $e->{stop_ref}); };
     }
 }
 
@@ -1663,12 +1758,11 @@ my $_vizLastSource     = '';   # client id of source we're currently mirroring
 my $_vizLastTrackUrl   = '';   # last track url commanded to Visualizer
 my $_vizNoVizLogged    = 0;    # throttle for "no Visualizer player" log
 my $_vizAutoOffLogged  = 0;    # throttle for "auto-follow disabled" log
-# Player the visualizer should follow, as chosen by the display page. Empty =
-# auto (follow the most-active room). Set from the page's state.json poll, which
-# carries its ?player= selection every tick. NOTE: there is a single shared
-# Visualizer SqueezeLite, so this is global — if two displays pin different
-# rooms, the most recent poll wins. Fine for a single active display.
-my $_vizDesiredSource  = '';
+# $_vizDesiredSource is declared earlier (above the calibration handler, which
+# also reads/writes it). Empty = auto (follow the most-active room). Set from
+# the page's state.json poll, which carries its ?player= selection every tick.
+# NOTE: single shared Visualizer SqueezeLite, so this is global — if two
+# displays pin different rooms, the most recent poll wins.
 
 # Locate the Visualizer player by configured MAC. Returns the Slim::Player
 # client object only on exact (case-insensitive) match, or undef if not found
@@ -1860,11 +1954,16 @@ sub _vizReconcile {
         return;
     }
 
+    my $calActive = scalar keys %CALIBRATION_ACTIVE;
+
     # Auto-follow (mirror) can be disabled to test native LMS sync grouping.
-    # When off we issue NO commands to the Visualizer — it can sit in a room's
-    # sync group as a passive follower without the mirror rewriting the shared
-    # queue. The player + helper keep running so capture still works.
-    if (!$prefs->get('vizAutoFollow')) {
+    # When off we issue NO commands to the Visualizer. EXCEPTION: while a
+    # calibration tone is running we must mirror regardless, because that's how
+    # the tone reaches the Visualizer — through the exact same playback path
+    # (play + position-seek) used in normal use, so the offset we measure is the
+    # one that's actually correct for real playback. Calibration pins
+    # $_vizDesiredSource to its room (below) so the mirror follows the tone.
+    if (!$calActive && !$prefs->get('vizAutoFollow')) {
         $_vizAutoOffLogged //= 0;
         if (time() - $_vizAutoOffLogged > 60) {
             $_vizAutoOffLogged = time();
