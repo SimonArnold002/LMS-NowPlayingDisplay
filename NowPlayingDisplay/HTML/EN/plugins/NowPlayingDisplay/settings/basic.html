@@ -19,6 +19,9 @@
     <input type="text" class="stdedit" readonly size="60"
            data-npd-url="/plugins/NowPlayingDisplay/page"
            onclick="this.select();" />
+    <a class="npd-open" data-npd-url="/plugins/NowPlayingDisplay/page"
+       target="_blank" rel="noopener"
+       style="margin-left:8px; white-space:nowrap;">Open &#8599;</a>
   [% END %]
 
   [% IF players.size > 0 %]
@@ -34,6 +37,10 @@
             <input type="text" class="stdedit" readonly size="52"
                    data-npd-url="/plugins/NowPlayingDisplay/page?player=[% p.id | uri %]"
                    onclick="this.select();" />
+          </td>
+          <td style="vertical-align: middle; padding: 3px 0 3px 8px; white-space: nowrap;">
+            <a class="npd-open" data-npd-url="/plugins/NowPlayingDisplay/page?player=[% p.id | uri %]"
+               target="_blank" rel="noopener">Open &#8599;</a>
           </td>
           <td style="vertical-align: middle; padding: 3px 0 3px 10px; white-space: nowrap;">
             <span style="color:#888; font-size:0.85em;">[% "PLUGIN_NOWPLAYINGDISPLAY_VIZ_PLAYER_OFFSET" | string %]</span>
@@ -238,9 +245,17 @@ sudo apt install -y squeezelite python3 python3-numpy   # Debian/Ubuntu/DietPi
   // We can't do this server-side easily because the right host depends on
   // how the user reached LMS — same-LAN hostname, IP, mDNS, etc.
   (function() {
-    var inputs = document.querySelectorAll('input[data-npd-url]');
-    for (var i = 0; i < inputs.length; i++) {
-      inputs[i].value = window.location.origin + inputs[i].getAttribute('data-npd-url');
+    var nodes = document.querySelectorAll('[data-npd-url]');
+    for (var i = 0; i < nodes.length; i++) {
+      var abs = window.location.origin + nodes[i].getAttribute('data-npd-url');
+      if (nodes[i].tagName === 'A') {
+        // Clickable link: opens the display in a new browser tab. If it has no
+        // visible text, fall back to showing the absolute URL itself.
+        nodes[i].href = abs;
+        if (!nodes[i].textContent.trim()) nodes[i].textContent = abs;
+      } else {
+        nodes[i].value = abs;   // read-only copy field
+      }
     }
   })();
 

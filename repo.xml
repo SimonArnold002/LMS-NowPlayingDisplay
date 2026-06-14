@@ -3,13 +3,13 @@
     <title lang="EN">NowPlayingDisplay for Lyrion Music Server</title>
   </details>
   <plugins>
-    <plugin name="NowPlayingDisplay" version="0.37.12.0" minTarget="8.0.0" maxTarget="*">
+    <plugin name="NowPlayingDisplay" version="0.37.13.0" minTarget="8.0.0" maxTarget="*">
       <title lang="EN">Now Playing Share</title>
       <desc lang="EN">Use Browser to Display Now Playing and Visualisers to your TV</desc>
       <url>https://simonarnold002.github.io/LMS-NowPlayingDisplay/NowPlayingDisplay.zip</url>
       <creator>CrystalGipsy</creator>
       <email></email>
-      <sha>4446f0af028ecdce5c204792201e844cdb06f7c4</sha>
+      <sha>7c0fa56534e759cf86e0f3bf0c1fd5442b6ba3cb</sha>
     </plugin>
   </plugins>
 </extensions>
