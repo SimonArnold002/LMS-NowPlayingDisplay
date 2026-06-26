@@ -77,7 +77,7 @@ PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY
 	EN	Default visualizer sync offset (ms)
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_DELAY_DESC
-	EN	Fallback offset used when a player has no per-player offset set above. Positive pushes the visualization earlier (use if it lags the sound), negative later. Range -2000 to 2000. Note: very low bass naturally resolves a little later than treble in any FFT analyzer — that part isn't corrected by this offset.
+	EN	Fallback offset used when a player has no per-player offset set above. Delay-only: 0 = passthrough (visuals at the live capture edge, no added latency); raise it to delay the visuals so they line up with what the room is playing. Range 0 to 2000 ms. Note: very low bass naturally resolves a little later than treble in any FFT analyzer — that part isn't corrected by this offset.
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_PRESETS
 	EN	Visualizer delay presets
@@ -149,13 +149,13 @@ PLUGIN_NOWPLAYINGDISPLAY_VIZ_STYLE_BOKEH
 	EN	Orbs (soft drifting orbs of light)
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER
-	EN	Server-side audio analysis (experimental)
+	EN	Server-side visualizer
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_DESC
-	EN	Analyse the audio on the server (via a headless SqueezeLite + CAVA + WebSocket bridge) and render the visualizer from the server's band data, bypassing the Web Audio API. This is what allows the visualizer to work in Safari, iOS, and smart-TV browsers (which can't analyse audio reliably client-side). Requires the bridge helper to be running. Leave OFF for normal Chrome/Edge use.
+	EN	Master switch for the visualizer's server-side backend: a headless SqueezeLite captures the room's audio and a bundled FFT helper streams band data to the display over WebSocket (the only rendering path — it works in every browser, including Safari, iOS and smart-TV browsers). When ON, the plugin spawns and supervises SqueezeLite + the helper. When OFF, the supervisor stops both processes (and the Stop buttons below stay stopped) and the visualizer has no data source. Set the bridge URL below only to override the auto-derived one.
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_ENABLE
-	EN	Use server-side analysis when a bridge URL is configured
+	EN	Enable the server-side visualizer (runs SqueezeLite + FFT helper)
 
 PLUGIN_NOWPLAYINGDISPLAY_VIZ_SERVER_URL_DESC
 	EN	WebSocket URL of the running visualizer bridge (e.g. ws://lms-host:8770/). Used by the page to receive band data. The display device must be able to reach this URL.

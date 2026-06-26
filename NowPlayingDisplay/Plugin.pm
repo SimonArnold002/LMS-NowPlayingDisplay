@@ -2,18 +2,17 @@ package Plugins::NowPlayingDisplay::Plugin;
 
 # NowPlaying — a standalone now-playing display page for LMS.
 #
-# Read-only by default — no callbacks, no playback state changes from the
-# browser-audio path. The OPTIONAL server-side visualizer feature does add:
+# Read-only with respect to the user's rooms. The server-side visualizer
+# feature adds:
 #   - An auto-follow loop that mirrors the active room onto a dedicated
 #     headless SqueezeLite instance (the "Visualizer" player) so the
 #     server can analyse the audio. All commands gated by _isVizPlayer
 #     so it can only ever touch that specific MAC — _vizFindVisualizer
 #     is the chokepoint.
 #   - A bundled Python FFT helper (Bin/npd-vizfft.py) supervised by the
-#     plugin: spawned when server mode is enabled, restarted on death,
-#     stopped cleanly on plugin shutdown.
-# Both are off by default; with vizServerMode = 0 the plugin behaves as
-# the original strictly-read-only display.
+#     plugin: spawned when the visualizer is enabled, restarted on death,
+#     stopped cleanly on plugin shutdown. The helper streams band data to
+#     the page over WebSocket — the page never uses Web Audio.
 #
 # HTTP endpoints, all idempotent except the ones marked (*):
 #   /plugins/NowPlayingDisplay/page             -> display HTML
@@ -21,8 +20,6 @@ package Plugins::NowPlayingDisplay::Plugin;
 #   /plugins/NowPlayingDisplay/players.json     -> list of players for the dropdown
 #   /plugins/NowPlayingDisplay/biography.json   -> artist biography via MAI
 #   /plugins/NowPlayingDisplay/lyrics.json      -> synced lyrics via MAI
-#   /plugins/NowPlayingDisplay/streamurl        -> CDN URL + signature for streaming
-#   /plugins/NowPlayingDisplay/streamproxy      -> HMAC-gated CORS proxy
 #   /plugins/NowPlayingDisplay/setoffset    (*) -> save visualizer sync offset
 #   /plugins/NowPlayingDisplay/setstyle     (*) -> save visualizer style
 #   /plugins/NowPlayingDisplay/helper       (*) -> start/stop/restart/status/log
@@ -62,13 +59,33 @@ $prefs->init({
     defaultMode      => 'now-playing',
     scrollSpeed      => 'medium',              # low | medium | high
     enableVisualizer => 1,                     # on by default; settings can turn it off
-    vizDelayMs       => 80,                    # visualizer sync offset, signed ms
+    vizDelayMs       => 0,                     # global default sync offset (ms). Delay-only:
+                                               #   0 = passthrough (visuals at live edge),
+                                               #   positive = delay visuals to match the room
+    vizLeadMs        => 0,                      # start-time lead (ms): when we mirror a room's
+                                               #   track onto the Visualizer we seek it to the
+                                               #   room's MEASURED current position PLUS this
+                                               #   lead, so the Visualizer captures slightly
+                                               #   AHEAD of the room. That guarantees the
+                                               #   delay-only buffer (vizDelayMs) can always
+                                               #   pull the visuals back to exact sync — the
+                                               #   buffer can delay but never advance, so the
+                                               #   capture must lead. 0 = legacy behaviour
+                                               #   (seek only on source-switch/mid-track join,
+                                               #   to the room position, no per-track reseek).
     vizSmoothing     => 'medium',              # meter responsiveness: lively|medium|smooth|verysmooth
     vizStyle         => 'segmented',           # validated set: segmented, scope, ring,
                                                #   ringVivid, ringZoom, ringClassic,
                                                #   starburst, bokeh (see _handleSetStyle)
-    vizServerMode    => 0,                     # off by default; server-side FFT helper
-    vizBridgeUrl     => '',                    # ws://host:port/ of the helper when on
+    vizServerMode    => 0,                     # master switch for the server-side visualizer
+                                               #   backend (SqueezeLite capture + FFT helper +
+                                               #   mirror). Off = the supervisor stops both
+                                               #   processes and the Stop buttons stick. The
+                                               #   page is always server-rendered (browser
+                                               #   Web Audio was removed); with this off the
+                                               #   visualizer simply has no data source.
+    vizBridgeUrl     => '',                    # ws://host:port/ override for the helper URL;
+                                               #   blank = derive ws://<page-host>:8770/
     vizPlayerOffsets => {},                    # { playerId => ms } — per-player sync offset,
                                                #   set directly from the on-screen Save button
     vizPresets       => [],                    # DEPRECATED (named presets) — kept only so the
@@ -227,9 +244,12 @@ sub _writeOffsetFile {
     my ($ms) = @_;
     return undef unless defined $ms;
     $ms = int($ms);
-    $ms = 0 if $ms < 0;        # negative offsets are physically impossible
-                               # in the shmem-readback model; clamp silently.
-    $ms = 4500 if $ms > 4500;  # match helper's --max-offset-ms default
+    # Delay-only offset model: 0 = live capture edge (passthrough), positive =
+    # delay the visuals to match the room. There is no negative side (we can't
+    # show audio the room's stream hasn't produced yet), and the 2s buffer caps
+    # the delay at 2000ms — both matching the helper's clamp.
+    $ms = 0    if $ms < 0;
+    $ms = 2000 if $ms > 2000;
     open my $fh, '>', $HELPER_OFFSET_FILE or do {
         $log->warn("[helper] could not write offset file $HELPER_OFFSET_FILE: $!");
         return undef;
@@ -435,7 +455,8 @@ sub _helperStart {
         # Exec. On success, control never returns. On failure, fall through to
         # the guaranteed _exit below.
         { exec { $py } $py, $script, '--shmem', $shmem, '--port', $port,
-                                     '--offset-file', $HELPER_OFFSET_FILE; }
+                                     '--offset-file', $HELPER_OFFSET_FILE,
+                                     '--baseline-ms', 0, '--max-offset-ms', 2000; }
         print STDERR "[helper] exec($py $script ...) failed: $!\n";
         POSIX::_exit(127);
         # Belt and braces — should be unreachable.
@@ -443,7 +464,7 @@ sub _helperStart {
     }
 
     _helperWritePid($pid);
-    $log->info("[helper] spawned PID $pid ($py $script --shmem $shmem --port $port --offset-file $HELPER_OFFSET_FILE)");
+    $log->info("[helper] spawned PID $pid ($py $script --shmem $shmem --port $port --offset-file $HELPER_OFFSET_FILE --baseline-ms 0 --max-offset-ms 2000)");
 
     # Reap on death so we don't leave a zombie when supervisor checks fire.
     # SIGCHLD handler would be cleaner but interacts badly with LMS's event
@@ -930,12 +951,12 @@ sub _handleSqueezelite {
 #       command to play the tone WAV, schedules an auto-stop in case the
 #       browser disappears mid-calibration.
 #
-# Calibration plays a known sine-wave burst pattern through the room. The
-# browser-side JS detects bursts on both the local audio analyser (browser-
-# audio mode) and the server-side WebSocket frames, pairs them by burst
-# index, and computes the offset between hearing and seeing. The result is
-# saved to the per-player offset map (vizPlayerOffsets) so it Just
-# Works on the next page load for that player.
+# Calibration plays a known 1 Hz beep train through the room (and, via the
+# mirror, onto the Visualizer). The browser-side JS detects each beep onset in
+# the server-streamed audio and drives the bouncing-ball A/V-sync view, so the
+# user raises the offset until the on-screen strike/flash lands on the beep
+# they hear. The tuned value is saved to the per-player offset map
+# (vizPlayerOffsets) so it Just Works on the next page load for that player.
 
 # Tones we know about. Adding a new one is: drop the WAV in Bin/, add an
 # entry here with its center frequency for the eyeball-mode visualizer band.
@@ -954,6 +975,12 @@ my %CALIBRATION_ACTIVE;
 # the calibration handler below reads/writes it; the auto-follow code further
 # down uses the same variable.
 my $_vizDesiredSource = '';
+
+# Mirror trackers — declared here (not further down) so _calibrationStop above
+# the auto-follow code can reset them. _vizMirrorAction sets them; resetting them
+# forces the next reconcile to re-issue a fresh mirror.
+my $_vizLastSource     = '';   # client id of source we're currently mirroring
+my $_vizLastTrackUrl   = '';   # last track url commanded to Visualizer
 
 # Calibration WAV duration in seconds — keep in sync with the WAV files.
 # Plus a small grace period for the player to actually stop.
@@ -1029,7 +1056,11 @@ sub _calSnapshotPlaylist {
         my $req = Slim::Control::Request->new($client->id, ['status', 0, 99999, 'tags:u']);
         $req->execute();
         my $loop = $req->getResult('playlist_loop') || [];
-        $snap{urls}  = [ map { $_->{url} } grep { defined $_->{url} } @$loop ];
+        # Capture real track URLs only — NEVER the calibration tone itself (a
+        # defensive guard against snapshotting a tone that's already playing).
+        $snap{urls}  = [ grep { $_ !~ m{/calibration-[\w-]+\.wav(?:\?|\z)} }
+                         map  { $_->{url} }
+                         grep { defined $_->{url} } @$loop ];
         my $idx = $req->getResult('playlist_cur_index');
         my $t   = $req->getResult('time');
         $snap{index} = (defined $idx && $idx =~ /^\d+$/)      ? $idx : 0;
@@ -1046,8 +1077,12 @@ sub _calRestorePlaylist {
     my ($client, $snap) = @_;
     return unless $client && $snap && ref($snap->{urls}) eq 'ARRAY';
     my @urls = @{ $snap->{urls} };
+    # Nothing to restore → do NOT clear. _calibrationStop has already stopped +
+    # cleared the tone by the time we get here, so an empty snapshot means "leave
+    # the room empty", not "wipe whatever's there". (Clearing here on an empty
+    # snapshot is how a bad/streaming snapshot used to nuke the user's queue.)
+    return unless @urls;
     eval { $client->execute(['playlist', 'clear']); };
-    return unless @urls;                      # room was idle — nothing to put back
     for my $u (@urls) {
         eval { $client->execute(['playlist', 'add', $u]); };
     }
@@ -1118,34 +1153,61 @@ sub _handleCalibrate {
         my $url = Slim::Utils::Misc::fileURLFromPath($wavPath);
         $log->info("[calib] start tone=$tone player=$playerId url=$url");
 
-        # Cancel any prior auto-stop for this player.
-        if (my $prior = delete $CALIBRATION_ACTIVE{$playerId}) {
-            eval { Slim::Utils::Timers::killTimers(undef, $prior->{stop_ref}); };
+        my $stopRef = sub { _calibrationStop($playerId); };
+
+        # If calibration is ALREADY running on this room, the live queue is the
+        # TONE now. Re-snapshotting here would capture the tone (or an empty,
+        # mid-transition queue) and PERMANENTLY lose the user's music — the
+        # snapshot is the only copy once the tone is playing. So on a re-start
+        # REUSE the original snapshot + original pre-calibration mirror pin.
+        my $existing = delete $CALIBRATION_ACTIVE{$playerId};
+        eval { Slim::Utils::Timers::killTimers(undef, $existing->{stop_ref}); } if $existing;
+
+        my ($snap, $prevRepeat, $prevDesired);
+        if ($existing) {
+            $snap        = $existing->{snapshot};
+            $prevRepeat  = $existing->{prev_repeat};
+            $prevDesired = $existing->{prev_desired};
+            $log->info("[calib] re-start on active player $playerId; reusing saved snapshot ("
+                       . scalar(@{ $snap->{urls} || [] }) . " tracks) — NOT re-snapshotting the tone");
+        } else {
+            # Fresh start. Capture repeat + queue BEFORE we replace it with the tone.
+            $prevRepeat = eval {
+                my $req = Slim::Control::Request->new($client->id, ['playlist', 'repeat', '?']);
+                $req->execute();
+                $req->getResult('_repeat');
+            };
+            $prevRepeat  = 0 unless defined $prevRepeat && $prevRepeat =~ /^\d+$/;
+            $prevDesired = $_vizDesiredSource;
+            $snap = _calSnapshotPlaylist($client);
+
+            # QUEUE SAFETY: if the room is actively playing/paused but the
+            # snapshot captured ZERO tracks, the snapshot is unreliable (a
+            # streaming track, or a mid-track transition 'status' didn't return).
+            # Replacing the live queue with the tone now would lose the user's
+            # music for good. Refuse rather than risk it.
+            my $busy    = defined $snap->{mode} && $snap->{mode} ne 'stop';
+            my $ntracks = scalar(@{ $snap->{urls} || [] });
+            if ($busy && $ntracks == 0) {
+                $log->warn("[calib] ABORT start: room mode=$snap->{mode} but snapshot has 0 tracks; "
+                           . "refusing so we don't clear the queue");
+                _send($httpClient, $response, 'application/json',
+                      encode_json({ ok => \0,
+                          error => "Couldn't safely save this room's play queue (streaming track?). "
+                                 . "Calibration aborted to protect your music — pause the room, or use a local track." }),
+                      no_cache => 1);
+                return;
+            }
         }
-
-        # Remember the player's current repeat mode so we can restore it
-        # when calibration stops. The 'playlist repeat ?' query returns the
-        # current value as a string: 0=none, 1=track, 2=playlist.
-        my $prevRepeat = eval {
-            my $req = Slim::Control::Request->new($client->id, ['playlist', 'repeat', '?']);
-            $req->execute();
-            $req->getResult('_repeat');
-        };
-        $prevRepeat = 0 unless defined $prevRepeat && $prevRepeat =~ /^\d+$/;
-
-        # Snapshot the room's queue BEFORE we touch it, so we can put the
-        # user's music back exactly where it was when calibration stops.
-        my $snap = _calSnapshotPlaylist($client);
 
         # Mark calibration active BEFORE playing anything. This makes the
         # mirror (which we override-on below) carry the tone to the Visualizer.
-        my $stopRef = sub { _calibrationStop($playerId); };
         $CALIBRATION_ACTIVE{$playerId} = {
             stop_ref     => $stopRef,
             prev_repeat  => $prevRepeat,
             snapshot     => $snap,
             viz_mac      => $vizMac,
-            prev_desired => $_vizDesiredSource,   # restore the mirror pin on stop
+            prev_desired => $prevDesired,   # restore the mirror pin on stop
         };
 
         # Pin the auto-follow mirror to THIS room for the duration. The mirror
@@ -1171,7 +1233,14 @@ sub _handleCalibrate {
 
         # Safety net: stop after a generous timeout so the room doesn't beep
         # forever if the browser tab is closed without a stop.
-        Slim::Utils::Timers::setTimer($client,
+        # CRITICAL: register the timer against undef (NOT $client) so it matches
+        # the killTimers(undef, $stopRef) calls in _calibrationStop / re-start.
+        # LMS matches timers on the (object, coderef) PAIR — a timer set on
+        # $client could never be cancelled with undef, so the 10-min fuse
+        # survived every normal Stop and later fired during ordinary playback,
+        # running the destructive teardown (playlist clear + power-cycle) and
+        # WIPING the user's queue "for no reason".
+        Slim::Utils::Timers::setTimer(undef,
             Time::HiRes::time() + $CALIBRATION_AUTOSTOP_SECS,
             $stopRef);
 
@@ -1223,6 +1292,16 @@ sub _calibrationStop {
     return unless $playerId;
 
     my $entry      = $CALIBRATION_ACTIVE{$playerId};
+
+    # STALE-TIMER / DOUBLE-STOP SAFETY: only ever run the destructive teardown
+    # below (stop + playlist clear + power-cycle on the ROOM) when calibration is
+    # ACTUALLY active for this player. If there's no active entry, calibration is
+    # already stopped — there's no tone to clear and no snapshot to restore, so
+    # touching the room here would just wipe whatever the user is now playing.
+    # This is the belt-and-braces guard behind the timer-cancel fix: even if a
+    # stray stop fires, it can never clear a live queue.
+    return unless $entry;
+
     my $prevRepeat = $entry ? $entry->{prev_repeat} : 0;
     my $snap       = $entry ? $entry->{snapshot}    : undef;
     my $vizMac     = $entry ? $entry->{viz_mac}     : ($prefs->get('vizPlayerMac') // '');
@@ -1233,6 +1312,15 @@ sub _calibrationStop {
         $_vizDesiredSource = $entry->{prev_desired};
     }
 
+    # Reset the mirror trackers. We're about to clear the Visualizer, so the
+    # next reconcile MUST re-issue a fresh mirror — even if the same room
+    # re-starts the SAME tone. Without this, $_vizLastTrackUrl still equals the
+    # tone URL, the reconcile sees "same track already mirrored", skips the
+    # play, and the Visualizer sits empty → the browser shows "Waiting for
+    # calibration tone" forever (the start/stop race you hit).
+    $_vizLastSource   = '';
+    $_vizLastTrackUrl = '';
+
     # 1. Stop + clear the tone on the Visualizer. Once the mirror is
     #    un-suppressed (below) its next reconcile re-takes the Visualizer.
     if ($vizMac) {
@@ -1240,6 +1328,10 @@ sub _calibrationStop {
         if ($viz) {
             eval { $viz->execute(['stop']); };
             eval { $viz->execute(['playlist', 'clear']); };
+            # Clear the calibration loop's repeat (set on the Visualizer while the
+            # tone played) so normal mirrored playback — which re-plays each track
+            # itself — doesn't loop a single track.
+            eval { $viz->execute(['playlist', 'repeat', 0]); };
         }
     }
 
@@ -1382,13 +1474,10 @@ sub initPlugin {
         qr{^/plugins/NowPlayingDisplay/setlivenoffset\b}, \&_handleSetLiveOffset,
     );
     Slim::Web::Pages->addRawFunction(
+        qr{^/plugins/NowPlayingDisplay/setlead\b},       \&_handleSetLead,
+    );
+    Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/setstyle\b},      \&_handleSetStyle,
-    );
-    Slim::Web::Pages->addRawFunction(
-        qr{^/plugins/NowPlayingDisplay/streamurl\b},     \&_handleStreamUrl,
-    );
-    Slim::Web::Pages->addRawFunction(
-        qr{^/plugins/NowPlayingDisplay/streamproxy\b},   \&_handleStreamProxy,
     );
     Slim::Web::Pages->addRawFunction(
         qr{^/plugins/NowPlayingDisplay/helper\b},        \&_handleHelper,
@@ -1577,11 +1666,6 @@ sub _snapshotFor {
     $snap->{duration} ||= ($remote->{duration} // 0) + 0;
     $snap->{track_url} ||= $remote->{url}     // '';
 
-    # The resolved stream URL for remote tracks is NOT read here (that would
-    # touch the live song object on every poll). The visualizer fetches it
-    # on demand, once per track, via the /streamurl endpoint instead.
-    $snap->{stream_url} = '';
-
     # Artwork resolution — order matters:
     #   1. artwork_url: streaming services and remote tracks all set this to
     #      an LMS imageproxy path like '/imageproxy/<encoded URL>/image.jpg'.
@@ -1697,9 +1781,8 @@ sub _handleSetOffset {
     }
 
     # Apply live. The tuned player is the one currently being followed, so
-    # writing $ms here takes effect on the helper's next poll (~100ms). The
-    # helper clamps negatives to 0 (can't show future audio); browser-audio mode
-    # still uses the signed value for its own seek.
+    # writing $ms here takes effect on the helper's next poll (~100ms).
+    # _writeOffsetFile clamps to [0, 2000] (delay-only: 0 = passthrough).
     _writeOffsetFile($ms);
     _send($httpClient, $response, 'application/json',
           encode_json({ ok => \1, ms => $ms, scope => $scope,
@@ -1723,6 +1806,27 @@ sub _handleSetLiveOffset {
     my $written = _writeOffsetFile($ms);
     _send($httpClient, $response, 'application/json',
           encode_json({ ok => \1, ms => $ms, applied => $written }), no_cache => 1);
+}
+
+# Persist the start-time lead (ms) used by the mirror seek (vizLeadMs). The
+# self-test recommends a value; this endpoint lets the page apply it. Global
+# (not per-player) — it's a property of the Visualizer's start latency, not of
+# any one room. Takes effect on the NEXT track load (the seek path reads the
+# pref fresh each mirror). Range [0, 4000].
+sub _handleSetLead {
+    my ($httpClient, $response) = @_;
+    my %q = $response->request->uri->query_form;
+    my $ms = $q{ms};
+    $ms = '' unless defined $ms;
+    $ms =~ s/[^\d]//g;
+    $ms = 0 unless $ms =~ /^\d+$/;
+    $ms = int($ms);
+    $ms = 0    if $ms < 0;
+    $ms = 4000 if $ms > 4000;
+    $prefs->set('vizLeadMs', $ms);
+    $log->info("[viz] saved start lead ${ms}ms");
+    _send($httpClient, $response, 'application/json',
+          encode_json({ ok => \1, ms => $ms }), no_cache => 1);
 }
 
 # Persist the visualizer style from the on-screen Style button.
@@ -1754,8 +1858,8 @@ sub _handleSetStyle {
 
 # Module-level state for stage 2 (auto-follow).
 my $_vizAutoSubscribed = 0;
-my $_vizLastSource     = '';   # client id of source we're currently mirroring
-my $_vizLastTrackUrl   = '';   # last track url commanded to Visualizer
+# $_vizLastSource / $_vizLastTrackUrl declared earlier (next to $_vizDesiredSource)
+# so _calibrationStop can reset them.
 my $_vizNoVizLogged    = 0;    # throttle for "no Visualizer player" log
 my $_vizAutoOffLogged  = 0;    # throttle for "auto-follow disabled" log
 # $_vizDesiredSource is declared earlier (above the calibration handler, which
@@ -1844,6 +1948,9 @@ sub _vizMirrorAction {
     # hitches the analysed audio. Only correct genuine drift, handled by the
     # reconcile loop comparing positions.
     my $srcId = $sourceClient->id // '';
+    # Did we switch to a DIFFERENT room since the last mirror, vs. the same room
+    # just rolling on to its next track? Captured before we update the tracker.
+    my $sourceChanged = ($_vizLastSource ne $srcId);
     if ($_vizLastSource eq $srcId && $_vizLastTrackUrl eq $trackUrl) {
         $info->{seekedOnly} = 1 if $info;
         $info->{alreadyMirroring} = 1 if $info;
@@ -1855,25 +1962,66 @@ sub _vizMirrorAction {
         return 0 unless $playOk;
         $_vizLastSource   = $srcId;
         $_vizLastTrackUrl = $trackUrl;
-        # Delayed seek: fire after the stream's had a moment to load. Without
-        # this, 'time' fires before playback is actually established and is
-        # silently dropped → Visualizer plays from 0.
-        if ($pos > 0.5) {
+
+        # Calibration: the room loops the tone (repeat 1). Mirror that onto the
+        # Visualizer so it loops too — otherwise it plays the tone once, ends,
+        # and the reconcile resume path (pause 0 + time) fires on an ended
+        # playlist every ~60s, which glitches / sticks the calibration view.
+        if ($CALIBRATION_ACTIVE{$srcId}) {
+            eval { Slim::Control::Request::executeRequest($vizClient, ['playlist', 'repeat', 1]); };
+            $info->{calRepeat} = 1 if $info;
+        }
+
+        # Decide whether to seek the Visualizer after the stream loads.
+        #
+        # vizLeadMs == 0 (legacy/default): seek ONLY when joining a source that
+        # might be mid-track — the first mirror or a room switch. For an ordinary
+        # sequential track advance on the SAME room, the room and the Visualizer
+        # both roll into the new track from ~0 at about the same moment, so a seek
+        # is redundant AND forces a SECOND stream reload → the blank/glitch at
+        # every track change. Skip it there.
+        #
+        # vizLeadMs > 0: the user wants the Visualizer to capture AHEAD of the
+        # room so the delay buffer can pull it to exact sync. A lead does not
+        # persist across tracks (each track is a fresh stream that starts at 0 on
+        # both players, and per-device start latency recurs), so we must re-apply
+        # it on EVERY new track — including same-room advances. We accept the one
+        # extra reload per track as the cost of reliable sync; without it the
+        # Visualizer drifts behind on slow-to-start (e.g. bridged) rooms and the
+        # delay-only buffer can't recover it.
+        my $leadMs = int($prefs->get('vizLeadMs') // 0);
+        my $lead   = $leadMs / 1000.0;
+        # Seek on a mid-track join (any time), or — when a lead is configured —
+        # on every fresh load so the Visualizer always starts ahead.
+        my $doSeek = ($sourceChanged && $pos > 0.5) || ($leadMs > 0);
+        if ($doSeek) {
+            my $srcRef = $sourceClient;
             Slim::Utils::Timers::setTimer(
                 undef, Time::HiRes::time() + 0.6,
                 sub {
-                    my ($vc, $newPos) = ($vizClient, $pos);
-                    # Re-vet the target one more time before commanding. By
-                    # the time the timer fires the client may have gone; refuse
-                    # if its id no longer matches the configured MAC.
+                    my $vc = $vizClient;
+                    # Re-vet the target before commanding: the client may have
+                    # gone; refuse if its id no longer matches the configured MAC.
                     my ($recheck, $mac) = _vizFindVisualizer();
                     return unless $recheck && lc($recheck->id // '') eq lc($vc->id // '');
+                    # Re-measure the ROOM's CURRENT position now (the stream has
+                    # had 0.6s to load and the room has truly "registered"
+                    # playback), rather than reusing the stale position captured
+                    # when we issued play. Seek the Visualizer to room-now + lead
+                    # so its capture sits `lead` ms ahead of the room.
+                    my $newPos;
+                    eval { $newPos = $srcRef->songElapsedSeconds };
+                    $newPos = $pos unless defined $newPos && $newPos >= 0;
+                    $newPos += $lead;
+                    $newPos = 0 if $newPos < 0;
                     eval {
                         Slim::Control::Request::executeRequest($vc, ['time', $newPos]);
                     };
                 }
             );
         }
+        $info->{seeked}  = $doSeek ? 1 : 0 if $info;
+        $info->{leadMs}  = $leadMs if $info;
     }
 
     if ($info) {
@@ -2067,182 +2215,6 @@ sub _vizReconcile {
     # we deliberately do nothing here.
 }
 
-# On-demand resolved stream URL for the visualizer. Called only when the
-# visualizer is active on a remote/streaming track, and only once per track
-# change — NOT on every status poll. Reads the resolved CDN URL the streaming
-# plugin (Qobuz, Bandcamp, etc.) stored on the current Song object. Returns it
-# as JSON so the page can fetch/analyse the actual audio. Local tracks and
-# sources that only expose an internal protocol URL return an empty url.
-# Same-origin stream proxy for CORS-blocked streaming services (Bandcamp, etc.).
-# The browser can't run Web Audio analysis on a cross-origin stream whose CDN
-# doesn't send CORS headers. So the page fetches the audio FROM US instead:
-# we fetch the resolved public CDN URL server-side and relay the bytes. Because
-# the browser talks to our own origin, CORS doesn't apply and the analyser can
-# read the samples.
-#
-# SAFETY: this only ever fetches the public URL passed in ?url= (which the
-# visualizer resolved). It never touches the player/song object, so it cannot
-# affect playback.
-#
-# This version relays a FINITE resource (a track file, e.g. Bandcamp). It is
-# NOT suitable for an endless live stream (e.g. Radio Paradise) — that needs a
-# true chunked relay, handled separately.
-#
-# Per-install proxy signing secret. Generated once on first use and persisted
-# in prefs. Used to HMAC URLs the plugin emits so the proxy can verify it
-# only relays URLs we ourselves issued (no SSRF via arbitrary ?url=).
-sub _proxySecret {
-    my $s = $prefs->get('proxySecret');
-    if (!$s || length($s) < 32) {
-        # 32 bytes of entropy → 64-char hex secret. Per-install, never sent
-        # to the client (only HMACs derived from it leave the server).
-        my $bytes = '';
-        for (1..32) { $bytes .= chr(int(rand(256))); }
-        $s = unpack('H*', $bytes);
-        $prefs->set('proxySecret', $s);
-    }
-    return $s;
-}
-
-# Sign a URL we're about to emit through /streamurl so /streamproxy can later
-# verify it. SHA-256 HMAC, hex-encoded. Digest::SHA is core Perl since 5.10
-# and is what LMS already depends on elsewhere.
-sub _signProxyUrl {
-    my ($url) = @_;
-    require Digest::SHA;
-    return Digest::SHA::hmac_sha256_hex($url, _proxySecret());
-}
-
-# Constant-time string compare so signature checks don't leak via early-exit
-# timing differences. Tiny win at this scale but free to do right.
-sub _constantTimeEq {
-    my ($a, $b) = @_;
-    return 0 if length($a) != length($b);
-    my $diff = 0;
-    for my $i (0 .. length($a) - 1) {
-        $diff |= ord(substr($a, $i, 1)) ^ ord(substr($b, $i, 1));
-    }
-    return $diff == 0;
-}
-
-sub _handleStreamProxy {
-    my ($httpClient, $response) = @_;
-    my %q = $response->request->uri->query_form;
-    my $url = $q{url} // '';
-    my $sig = $q{sig} // '';
-
-    unless ($url =~ m{^https?://}i) {
-        $response->code(400);
-        _send($httpClient, $response, 'text/plain', 'bad url', no_cache => 1);
-        return;
-    }
-
-    # HMAC gate — must match a signature this plugin issued from /streamurl.
-    # Without this, the proxy was an open relay: anyone reachable on the LMS
-    # port could fetch arbitrary http(s) URLs through us (SSRF against router
-    # admin pages, internal services, cloud metadata endpoints, etc.). Now
-    # only URLs we ourselves emitted are accepted, since only we know the
-    # per-install secret.
-    my $expected = _signProxyUrl($url);
-    if (!$sig || !_constantTimeEq($sig, $expected)) {
-        $log->warn('NowPlayingDisplay stream proxy: bad/missing signature, refusing');
-        $response->code(403);
-        _send($httpClient, $response, 'text/plain', 'forbidden', no_cache => 1);
-        return;
-    }
-
-    Slim::Networking::SimpleAsyncHTTP->new(
-        sub {
-            my $http = shift;
-            my $ct   = $http->headers->content_type || 'application/octet-stream';
-            my $body = $http->content;
-            $response->code(200);
-            $response->header('Content-Type'   => $ct);
-            $response->header('Content-Length'  => length($body));
-            $response->header('Access-Control-Allow-Origin' => '*');
-            $response->header('Cache-Control'  => 'no-store');
-            $response->content($body);
-            Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$body);
-        },
-        sub {
-            my $http  = shift;
-            my $error = shift || 'fetch failed';
-            $log->warn("NowPlayingDisplay stream proxy failed: $error");
-            $response->code(502);
-            my $b = 'proxy fetch failed';
-            $response->header('Content-Type'  => 'text/plain');
-            $response->header('Content-Length' => length($b));
-            Slim::Web::HTTP::addHTTPResponse($httpClient, $response, \$b);
-        },
-        { timeout => 30 },
-    )->get($url);
-}
-
-sub _handleStreamUrl {
-    my ($httpClient, $response) = @_;
-    my %q = $response->request->uri->query_form;
-    my $playerId = $q{player} // '';
-    my $debug    = $q{debug};
-
-    my $client;
-    if ($playerId eq '' || lc($playerId) eq 'auto') {
-        $client = _autoActivePlayer();
-    } else {
-        $client = Slim::Player::Client::getClient($playerId);
-    }
-
-    my $url = '';
-    my $needsProxy = \0;   # JSON false; true for CORS-blocked sources
-    my %dbg;
-    if ($client) {
-        eval {
-            my $song = $client->playingSong;
-            $dbg{have_song} = $song ? 1 : 0;
-            if ($song) {
-                my $su = $song->streamUrl;
-                $dbg{stream_url_raw} = defined $su ? $su : '(undef)';
-                my $tr = eval { $song->track ? $song->track->url : '' };
-                $dbg{track_url_raw} = $tr // '';
-                eval {
-                    for my $k (qw(streamUrl url gapless_url)) {
-                        my $v = $song->pluginData($k);
-                        $dbg{"pluginData_$k"} = $v if defined $v && !ref $v;
-                    }
-                };
-                $url = $su if $su && $su =~ m{^https?://};
-
-                # Decide whether this source needs the same-origin proxy. This
-                # is by SOURCE PROTOCOL (deterministic) rather than runtime
-                # timing/error guessing. Qobuz's CDN allows CORS so it plays
-                # direct; Bandcamp and Radio Paradise are CORS-blocked and must
-                # go through our proxy. Default unknown remote sources to proxy
-                # (safer — works even if their CDN blocks CORS).
-                my $proto = ($tr && $tr =~ m{^([a-z0-9\+\-]+)://}i) ? lc($1) : '';
-                $dbg{source_proto} = $proto;
-                if ($proto eq 'qobuz') {
-                    $needsProxy = \0;          # direct works
-                } elsif ($proto) {
-                    $needsProxy = \1;          # bandcamp, radioparadise, others
-                }
-            }
-        };
-        $dbg{eval_error} = $@ if $@;
-    } else {
-        $dbg{have_client} = 0;
-    }
-
-    my $out = { url => $url, needsProxy => $needsProxy };
-    # If this URL is going to be proxied, include an HMAC the client can pass
-    # back to /streamproxy. Skipped when not proxied — direct CDN URLs (Qobuz)
-    # don't touch our server at all, so no need to sign them.
-    if ($url && ${$needsProxy}) {
-        $out->{sig} = _signProxyUrl($url);
-    }
-    $out->{debug} = \%dbg if $debug;
-    _send($httpClient, $response, 'application/json',
-          encode_json($out), no_cache => 1);
-}
-
 sub _handleStateJson {
     my ($httpClient, $response) = @_;
     my %q = $response->request->uri->query_form;
@@ -2305,6 +2277,7 @@ sub _liveConfig {
         viz       => {
             playerOffsets => $offs,
             default    => $vizDefault + 0,
+            leadMs     => int($prefs->get('vizLeadMs') // 0),
             smoothing  => ($prefs->get('vizSmoothing') // 'medium'),
             style      => ($prefs->get('vizStyle') // 'segmented'),
             # Server-side analysis mode (opt-in, default OFF): when on AND a
@@ -2699,6 +2672,7 @@ sub _handlePage {
     my $vizCfg = encode_json({
         playerOffsets => $offs,
         default    => $vizDefault + 0,
+        leadMs     => int($prefs->get('vizLeadMs') // 0),
         smoothing  => ($prefs->get('vizSmoothing') // 'medium'),
         style      => ($prefs->get('vizStyle') // 'segmented'),
         serverMode => ($prefs->get('vizServerMode') ? \1 : \0),
@@ -3155,6 +3129,40 @@ sub _pageHtml { return <<'HTML'; }
     background: rgba(79,176,208,0.9); color: #fff;
     padding: 3px 10px; border-radius: 8px; font-size: 0.8rem;
   }
+  .viz-tlegend {
+    position: absolute; bottom: -22px; left: 50%; transform: translateX(-50%);
+    white-space: nowrap; color: var(--label,#999); font-size: 0.72rem; opacity: 0.8;
+  }
+
+  /* System-delay self-test results panel — centered card the ⏱ Test button
+     reveals. Shows the measured software pipeline budget + a Lead stepper. */
+  .viz-selftest {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    min-width: 320px; max-width: 86vw;
+    background: rgba(16,18,22,0.94);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 16px;
+    padding: 20px 22px 18px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.6);
+    color: #fff; z-index: 8;
+    font-size: 0.92rem; line-height: 1.5;
+  }
+  .viz-selftest h3 {
+    margin: 0 0 10px; font-size: 1.0rem; font-weight: 700; letter-spacing: 0.02em;
+  }
+  .viz-stline { display: flex; justify-content: space-between; gap: 18px; }
+  .viz-stline .v { font-variant-numeric: tabular-nums; color: #9fd8e8; font-weight: 600; }
+  .viz-stline.total { border-top: 1px solid rgba(255,255,255,0.14); margin-top: 6px; padding-top: 6px; }
+  .viz-stline.total .v { color: #fff; }
+  .viz-stnote { margin-top: 10px; font-size: 0.78rem; color: var(--label,#9a9a9a); line-height: 1.45; }
+  .viz-stlead {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.14);
+  }
+  .viz-stlead .lbl { color: var(--label,#bbb); font-size: 0.82rem; }
+  .viz-stlead .lv { min-width: 56px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .viz-stactions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 
   /* Calibration tone buttons. When a tone is playing, the active button
      glows so it's obvious which tone is on (and that "tap again to stop"
@@ -3632,10 +3640,34 @@ sub _pageHtml { return <<'HTML'; }
            its own tone on/off; switching to the other tone stops the first. -->
       <button id="viz-tcal1k"  class="viz-tbtn viz-tcal" title="Start 1 kHz calibration tone">♪ 1k</button>
       <button id="viz-tcal200" class="viz-tbtn viz-tcal" title="Start 200 Hz calibration tone">♪ 200</button>
+      <button id="viz-ttest" class="viz-tbtn" title="Measure system delay">⏱ Test</button>
       <div id="viz-tsaved" class="viz-tsaved" hidden>Saved</div>
+      <div class="viz-tlegend">0 = passthrough · raise to delay visuals to match the room</div>
     </div>
-
-    <audio id="viz-audio" preload="auto" playsinline></audio>
+    <!-- System-delay self-test results (hidden until ⏱ Test is run). -->
+    <div id="viz-selftest" class="viz-selftest" hidden>
+      <h3>System delay</h3>
+      <div class="viz-stline"><span>FFT processing</span><span class="v" id="viz-st-proc">–</span></div>
+      <div class="viz-stline"><span>Transport (server→browser)</span><span class="v" id="viz-st-net">–</span></div>
+      <div class="viz-stline"><span>Browser draw</span><span class="v" id="viz-st-draw">–</span></div>
+      <div class="viz-stline"><span>Delay buffer (your offset)</span><span class="v" id="viz-st-offset">–</span></div>
+      <div class="viz-stline total"><span>Known total</span><span class="v" id="viz-st-total">–</span></div>
+      <div class="viz-stnote">
+        Display/TV panel latency can't be measured in software — use the ♪
+        calibration to absorb it. The <b>Lead</b> makes the Visualizer capture
+        ahead of the room so the delay buffer can always pull it into sync
+        (raise it if visuals start behind on slow/bridged rooms).
+      </div>
+      <div class="viz-stlead">
+        <span class="lbl">Start lead</span>
+        <button id="viz-lead-minus" class="viz-tbtn" title="−50 ms">−50</button>
+        <span class="lv"><span id="viz-lead-ms">0</span> ms</span>
+        <button id="viz-lead-plus" class="viz-tbtn" title="+50 ms">+50</button>
+      </div>
+      <div class="viz-stactions">
+        <button id="viz-st-close" class="viz-tbtn">Close</button>
+      </div>
+    </div>
   </section>
 
 <script>
@@ -3661,24 +3693,12 @@ sub _pageHtml { return <<'HTML'; }
   // Priority: ?mode=<x> URL param > localStorage > default.
   // The visualizer is opt-in (admin setting); only offered when enabled.
   const VIZ_ENABLED = __NPD_VIZ_ENABLED__;
-  // iOS Safari routes MediaElementSource to the speakers instead of through
-  // the Web Audio graph, so silent analysis is impossible — the visualizer is
-  // unsupported there and we don't offer it.
-  const VIZ_IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
-                  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  // In server-side analysis mode the page never touches Web Audio (the iOS
-  // wall), so iOS is fine and the visualizer should be available. This must
-  // be computed BEFORE the iOS visibility gate below.
-  const VIZ_CFG_PEEK = __NPD_VIZ_CFG__;
-  // Server mode is "available" whenever the admin has it on — the bridge URL is
-  // no longer required here. When the URL field is blank the page derives one
-  // (ws://<host>:8770/, see vizBridgeUrl), so leaving it empty must NOT hide the
-  // visualizer on iOS (which has no Web Audio fallback). Requiring bridgeUrl
-  // previously made "server mode on + URL blank" silently work on desktop only.
-  const VIZ_SERVER_AVAILABLE = !!(VIZ_CFG_PEEK && VIZ_CFG_PEEK.serverMode)
-                              || (location.search.indexOf('server=1') !== -1);
+  // The visualizer is ALWAYS server-driven now: a server-side FFT helper reads
+  // the dedicated Visualizer SqueezeLite's audio and streams band data to the
+  // page over WebSocket. The page never touches Web Audio, so every browser
+  // (including iOS Safari) is supported whenever the admin enables it.
   const VALID_MODES = ['now-playing', 'artwork', 'lyrics', 'ambient', 'vinyl', 'biography'];
-  if (VIZ_ENABLED && (!VIZ_IS_IOS || VIZ_SERVER_AVAILABLE)) {
+  if (VIZ_ENABLED) {
     VALID_MODES.push('visualizer');
     const vb = document.getElementById('viz-btn');
     if (vb) vb.hidden = false;
@@ -3921,9 +3941,8 @@ sub _pageHtml { return <<'HTML'; }
     document.body.classList.toggle('idle', idle);
     document.body.classList.toggle('has-track', !idle);
 
-    // Keep the visualizer's audio source slaved to the room player. Wrapped so
-    // any visualizer/stream error can NEVER break the main display update.
-    if (currentMode === 'visualizer') { try { vizSync(d); } catch(e){ console.warn('[npd viz] sync error', e); } }
+    // The visualizer is server-driven (helper FFT over WebSocket); the page has
+    // no local audio element to slave to the room, so nothing to do here.
 
     const title  = d.title  || (idle ? 'Nothing playing' : '');
     const artist = d.artist || '';
@@ -4466,63 +4485,16 @@ sub _pageHtml { return <<'HTML'; }
     lyrActive: () => lyrActiveIndex,
     mode:      () => currentMode,
     player:    () => currentPlayer,
-    viz:       () => {
-      const el = document.getElementById('viz-audio');
-      let amax = null, asample = null;
-      try {
-        if (vizAnalyser && vizData) {
-          vizAnalyser.getFloatFrequencyData(vizData);
-          let m = -Infinity;
-          for (let i = 0; i < vizData.length; i++) if (isFinite(vizData[i]) && vizData[i] > m) m = vizData[i];
-          amax = m;
-          asample = Array.from(vizData.slice(0, 5));
-        }
-      } catch(e) { amax = 'err:' + e.message; }
-      return {
-        ctxState:    vizCtx ? vizCtx.state : '(no ctx)',
-        sampleRate:  vizCtx ? vizCtx.sampleRate : null,
-        hasAnalyser: !!vizAnalyser,
-        hasSource:   !!vizSource,
-        analyserMaxDb: amax,
-        analyserSample: asample,
-        bass: (typeof vizRingBass !== 'undefined') ? vizRingBass : null,
-        bassNow: (function(){
-          try {
-            if (!vizAnalyser || !vizData) return null;
-            const binHz = (vizCtx ? vizCtx.sampleRate : 44100) / 2 / vizData.length;
-            const kLo = Math.max(1, Math.floor(50 / binHz));
-            const kHi = Math.min(vizData.length - 1, Math.floor(70 / binHz));
-            let kPeak = 0;
-            for (let b = kLo; b <= kHi; b++) {
-              const db = vizData[b];
-              if (db > -120) {
-                const lin = Math.pow(10, db / 20);
-                if (lin > kPeak) kPeak = lin;
-              }
-            }
-            return { rawPeak: kPeak, scaled: Math.min(1, kPeak * 80), binRange: [kLo, kHi] };
-          } catch(e) { return 'err:' + e.message; }
-        })(),
-        el: el ? {
-          crossOrigin: el.crossOrigin,
-          src:         (el.src || '').slice(0, 70),
-          paused:      el.paused,
-          muted:       el.muted,
-          currentTime: el.currentTime,
-          readyState:  el.readyState,
-          error:       el.error ? el.error.code : null,
-        } : '(no element)',
-        active:      vizActive,
-        trackId:     vizTrackId,
-        streamUrl:   (vizStreamUrl || '').slice(0, 70),
-      };
-    },
+    viz:       () => ({
+      active:      vizActive,
+      style:       vizStyle,
+      bass: (typeof vizRingBass !== 'undefined') ? vizRingBass : null,
+      haveFrame:   !!vizServerFrame,
+      haveWave:    !!vizServerWave,
+    }),
     server:    () => ({
-      isServerMode:  vizIsServerMode(),
-      cfgServerMode: VIZ_CFG && VIZ_CFG.serverMode,
       cfgBridgeUrl:  VIZ_CFG && VIZ_CFG.bridgeUrl,
       resolvedUrl:   vizBridgeUrl(),
-      urlOverride:   VIZ_SERVER_OVERRIDE,
       ws:            vizWs ? { readyState: vizWs.readyState, url: vizWs.url } : null,
       haveFrame:     !!vizServerFrame,
       frameLen:      vizServerFrame ? vizServerFrame.length : 0,
@@ -4808,49 +4780,25 @@ sub _pageHtml { return <<'HTML'; }
   }, 5000);
 
 
-  // ===== Visualizer engine =========================================
-  // Plays the current track (muted) purely as an analysis source, slaved to
-  // the room player. Real FFT via Web Audio drives a spectrum visual. Never
-  // touches LMS playback; no player is registered.
-  let vizCtx = null;        // AudioContext
-  let vizAnalyser = null;   // AnalyserNode
-  let vizSource = null;     // MediaElementSourceNode
-  let vizData = null;       // Uint8Array of frequency bins
+  // ===== Visualizer engine (server-driven) =========================
+  // A server-side FFT helper reads the dedicated Visualizer SqueezeLite's
+  // audio (-v shmem) and streams dB-per-bin frames (+ a decimated time-domain
+  // wave) to the page over WebSocket. The page renders from those frames — it
+  // never touches Web Audio, so it works on every browser including iOS/Safari
+  // and smart-TV browsers. The sync offset is applied server-side by the helper
+  // (it reads from a time-shifted position in its ring buffer), so what arrives
+  // here is already "the audio from N ms ago".
   let vizWave = null;       // Float32Array of time-domain samples (oscilloscope)
-  let vizStyle = 'segmented';  // segmented | radial | scope
+  let vizStyle = 'segmented';  // segmented | scope | ring* | starburst | bokeh
   let vizStyleTouched = false; // true once user cycles style on-screen this session
   let vizArtImg = null;        // <img> of current album art for the radial centre
   let vizArtUrl = '';          // last loaded art URL (avoids reloading each poll)
   let vizRAF = 0;           // requestAnimationFrame handle
   let vizActive = false;
-  let vizTrackId = null;    // track_id currently loaded into the audio el
-  let vizStreamUrl = '';    // resolved remote stream URL currently loaded (Qobuz etc.)
-  let vizRemoteTid = null;  // track_id of the remote track we last fetched a stream URL for
-  let vizStreamTimeout = 0; // detects continuous streams that never become playable
-  let vizLastSeek = 0;      // perf.now() of last position correction
-  let vizRoomPos = 0;       // room position (s) at last poll
-  let vizRoomPosAt = 0;     // perf.now() when that position was sampled
-  let vizRoomState = false; // was the room playing at last poll
-  let vizGestureArmed = false;
-  const vizAudio = () => document.getElementById('viz-audio');
 
   // --------------------------------------------------------------------------
-  // Server-side analysis mode (opt-in)
+  // Server bridge connection
   // --------------------------------------------------------------------------
-  // When enabled, audio is analysed on the server (SqueezeLite -v -> CAVA ->
-  // vizbridge WebSocket) and the browser receives band values directly. We
-  // bypass the Web Audio API entirely, which means it works in Safari, iOS, and
-  // smart-TV browsers that can't analyse via createMediaElementSource.
-  //
-  // Enabled when:
-  //   ?server=1 in the URL  (testing override), OR
-  //   VIZ_CFG.serverMode is true AND VIZ_CFG.bridgeUrl is set
-  const VIZ_SERVER_OVERRIDE = (location.search.indexOf('server=1') !== -1);
-  function vizIsServerMode() {
-    if (VIZ_SERVER_OVERRIDE) return true;
-    // bridgeUrl no longer required — vizBridgeUrl() derives one when it's blank.
-    return !!(VIZ_CFG && VIZ_CFG.serverMode);
-  }
   function vizBridgeUrl() {
     // Prefer an explicitly configured bridgeUrl. Otherwise derive one from the
     // host the page was loaded from, on the helper's default port (8770, which
@@ -4860,24 +4808,16 @@ sub _pageHtml { return <<'HTML'; }
     // resolves because we reached this very page through it.
     const cfg = (VIZ_CFG && VIZ_CFG.bridgeUrl) || '';
     if (cfg) return cfg;
-    if ((VIZ_CFG && VIZ_CFG.serverMode) || VIZ_SERVER_OVERRIDE) {
-      return 'ws://' + location.hostname + ':8770/';
-    }
-    return '';
+    return 'ws://' + location.hostname + ':8770/';
   }
 
   // Latest FFT bin frame (dB values) from the server. Sample rate and bin
   // width are carried in each frame so the page can do correct frequency
-  // mapping (handles sample-rate changes between tracks).
-  //
-  // The frames are buffered with arrival timestamps so the sync offset can
-  // be applied as a true visual delay: vizDraw() picks the buffered frame
-  // closest to (now - offsetMs) each animation frame, rather than always
-  // rendering the most recent one. Without this, the offset only has an
-  // effect on browser-audio mode (where it shifts the local audio element)
-  // and does nothing in server-only mode — the ±10/±50 tuner buttons would
-  // change the saved value but no visible shift happened.
-  let vizServerFrame = null;       // Float32Array — dB-per-bin (post-buffer-pick)
+  // mapping (handles sample-rate changes between tracks). The sync offset is
+  // applied server-side (the helper reads from a time-shifted ring position),
+  // so each frame is already "the audio from N ms ago" — we just store the
+  // latest and render it. No client-side buffering / picking required.
+  let vizServerFrame = null;       // Float32Array — dB-per-bin
   let vizServerWave  = null;       // Float32Array — time-domain samples (post-buffer-pick)
   let vizServerRate  = 44100;
   let vizServerBinHz = 0;
@@ -4888,6 +4828,14 @@ sub _pageHtml { return <<'HTML'; }
   // and render. No client-side buffering / picking required.
   let vizWs = null;
   let vizWsRetryT = null;
+  // --- System-delay self-test instrumentation ---------------------------
+  // Set when a data frame arrives; cleared when the next vizDraw paints it, so
+  // we can measure receive->draw latency. The self-test (vizRunSelfTest) sends
+  // {"ping":t} messages and the helper replies {"pong":t,"proc_ms":x}; we time
+  // the round trip (transport) and read proc_ms (helper FFT time) from it.
+  let vizFrameRecvT  = 0;       // performance.now() of the last unpainted frame
+  let vizFramePend   = false;   // a frame is waiting to be drawn
+  let vizSelftest    = null;    // active test accumulator, or null
   function vizServerConnect() {
     const url = vizBridgeUrl();
     if (!url) { vizHint('Server-side mode is on but no bridge URL configured'); return; }
@@ -4899,6 +4847,16 @@ sub _pageHtml { return <<'HTML'; }
     }
     vizWs.onopen = () => { vizHint(''); };
     vizWs.onmessage = (ev) => {
+      // Control messages (self-test pong) are JSON and start with '{'. Normal
+      // data frames start with the sample rate (a digit), so this is an
+      // unambiguous, cheap discriminator that doesn't disturb the data path.
+      if (ev.data.charCodeAt(0) === 123 /* '{' */) {
+        try { vizHandleControl(JSON.parse(ev.data)); } catch (e) {}
+        return;
+      }
+      // Stamp arrival for the receive->draw latency measurement.
+      vizFrameRecvT = performance.now();
+      vizFramePend  = true;
       // vizfft frame format: "<sr>;<binhz>;<db0>;<db1>;...;<dbN>|<w0>;<w1>;...;<wM>"
       //  - sr     : sample rate (int)
       //  - binhz  : Hz width of each downsampled FFT bin (float)
@@ -4955,310 +4913,124 @@ sub _pageHtml { return <<'HTML'; }
     if (vizWsRetryT) { clearTimeout(vizWsRetryT); vizWsRetryT = null; }
   }
 
-  let vizGain = null;
-  function vizBuildGraph() {
-    if (vizCtx) return;
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) { console.error('[npd viz] No Web Audio support'); return; }
-    vizCtx = new AC();
-    const el = vizAudio();
-    vizSource = vizCtx.createMediaElementSource(el);
-    vizAnalyser = vizCtx.createAnalyser();
-    vizAnalyser.fftSize = 8192;   // 4096 bins @ ~5.4Hz — enough resolution to
-                                  // separate the low bass bands (50/69/94Hz),
-                                  // which 2048 (21.5Hz/bin) smeared together
-    vizAnalyser.smoothingTimeConstant = 0.0;  // we apply uniform per-bar ballistics
-    vizAnalyser.minDecibels = -100;
-    vizAnalyser.maxDecibels = 0;
-    vizData = new Float32Array(vizAnalyser.frequencyBinCount);
-    vizWave = new Float32Array(vizAnalyser.fftSize);   // time-domain for scope
-    // Route source -> analyser -> gain(0) -> destination. We need a path to the
-    // destination because iOS Safari will otherwise BYPASS the Web Audio graph
-    // and play the element straight to the speakers (the "it just plays the
-    // audio" bug). A GainNode pinned to 0 keeps the graph live (so the analyser
-    // receives data) while producing silence. Desktop is happy with this too.
-    vizGain = vizCtx.createGain();
-    vizGain.gain.value = 0;
-    vizSource.connect(vizAnalyser);
-    vizAnalyser.connect(vizGain);
-    vizGain.connect(vizCtx.destination);
+  // --- System-delay self-test -------------------------------------------
+  // Handle a JSON control reply from the helper. Currently only the pong to
+  // our ping: it carries proc_ms (helper FFT processing) and lets us time the
+  // round trip (transport). Both feed the active self-test accumulator.
+  function vizHandleControl(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if ('pong' in msg && vizSelftest) {
+      const rtt = performance.now() - msg.pong;
+      vizSelftest.rtt.push(rtt);
+      if (typeof msg.proc_ms === 'number') vizSelftest.proc.push(msg.proc_ms);
+    }
+  }
+
+  function vizMedian(arr) {
+    if (!arr.length) return 0;
+    const a = arr.slice().sort((x, y) => x - y);
+    const m = a.length >> 1;
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  }
+
+  // Run a ~3s measurement: ping the helper repeatedly (transport + proc_ms) and
+  // sample receive->draw latency (collected in vizDraw). Report the budget.
+  function vizRunSelfTest() {
+    if (!vizWs || vizWs.readyState !== 1) {
+      vizHint('Visualizer not connected — can’t measure yet'); return;
+    }
+    if (vizSelftest) return;  // already running
+    vizSelftest = { rtt: [], proc: [], draw: [] };
+    const panel = document.getElementById('viz-selftest');
+    if (panel) panel.hidden = false;
+    setText('viz-st-proc', '…'); setText('viz-st-net', '…');
+    setText('viz-st-draw', '…'); setText('viz-st-total', '…');
+    setText('viz-st-offset', (vizCurrentOffsetMs() | 0) + ' ms');
+    let n = 0;
+    const ping = () => {
+      if (!vizSelftest) return;
+      if (vizWs && vizWs.readyState === 1) {
+        try { vizWs.send(JSON.stringify({ ping: performance.now() })); } catch (e) {}
+      }
+      if (++n < 30) { setTimeout(ping, 100); }   // 30 pings over ~3s
+      else { setTimeout(vizFinishSelfTest, 250); }
+    };
+    ping();
+  }
+
+  function vizFinishSelfTest() {
+    const t = vizSelftest; vizSelftest = null;
+    if (!t) return;
+    const proc = vizMedian(t.proc);
+    const net  = vizMedian(t.rtt) / 2;     // one-way ≈ RTT/2
+    const draw = vizMedian(t.draw);
+    const offs = vizCurrentOffsetMs() | 0;
+    const total = proc + net + draw + offs;
+    const fmt = (v) => (Math.round(v * 10) / 10) + ' ms';
+    setText('viz-st-proc',   fmt(proc));
+    setText('viz-st-net',    fmt(net));
+    setText('viz-st-draw',   fmt(draw));
+    setText('viz-st-offset', offs + ' ms');
+    setText('viz-st-total',  fmt(total));
+  }
+
+  function setText(id, txt) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+
+  // --- Start lead (vizLeadMs): how far AHEAD of the room the Visualizer is
+  // seeked at each track load, so the delay buffer can always pull it to sync.
+  // Global (a property of the Visualizer's start latency, not any one room).
+  // Initialized to 0 here (VIZ_CFG is declared later in the script — referencing
+  // it at eval time would hit the temporal dead zone). vizWireTuner() seeds it
+  // from VIZ_CFG.leadMs at start, after VIZ_CFG exists.
+  let vizLeadMs = 0;
+  let vizLeadSaveT = 0;
+  function vizUpdateLeadLabel() { setText('viz-lead-ms', vizLeadMs | 0); }
+  function vizNudgeLead(delta) {
+    vizLeadMs = Math.max(0, Math.min(4000, (vizLeadMs | 0) + delta));
+    vizUpdateLeadLabel();
+    // Debounce the persist so rapid taps issue one request. Takes effect on the
+    // next track load (the mirror seek reads vizLeadMs fresh each time).
+    if (vizLeadSaveT) clearTimeout(vizLeadSaveT);
+    vizLeadSaveT = setTimeout(() => {
+      vizLeadSaveT = 0;
+      fetch(`${BASE}/plugins/NowPlayingDisplay/setlead?ms=${vizLeadMs | 0}`)
+        .then(r => r.json())
+        .then((res) => { if (VIZ_CFG && res && typeof res.ms === 'number') VIZ_CFG.leadMs = res.ms; })
+        .catch(() => {});
+    }, 400);
   }
 
   function vizStart() {
     if (!VIZ_ENABLED) return;
-    // Server-side analysis mode: skip Web Audio entirely, open the WebSocket.
-    // iOS / Safari / TV browsers all work in this mode since they never touch
-    // the broken createMediaElementSource path.
-    if (vizIsServerMode()) {
-      vizActive = true;
-      const hint = document.getElementById('viz-hint');
-      if (hint) { hint.textContent = 'Connecting to server visualizer\u2026'; hint.style.opacity = '1'; }
-      if (VIZ_CFG && VIZ_CFG.smoothing) vizApplySmoothing(VIZ_CFG.smoothing);
-      vizServerConnect();
-      vizSizeCanvas();
-      vizWireTuner();      // Style button / arrow keys — were missing in server mode
-      if (VIZ_CFG && VIZ_CFG.style && VIZ_STYLES.indexOf(VIZ_CFG.style) >= 0 && !vizStyleTouched) {
-        vizStyle = VIZ_CFG.style;
-      }
-      vizUpdateStyleLabel();
-      vizShowTuner();
-      if (!vizRAF) vizRAF = requestAnimationFrame(vizDraw);
-      return;
-    }
-    // iOS Safari bypasses the Web Audio graph and plays the element straight
-    // to the speakers (no silent analysis possible), so the visualizer is not
-    // supported there. Show a message instead of ever playing audio aloud.
-    if (VIZ_IS_IOS) {
-      vizActive = false;
-      vizHint('Visualizer isn\u2019t supported on iOS / iPadOS');
-      return;
-    }
+    // Server-driven: open the WebSocket to the helper and render its frames.
+    // Works on every browser (iOS / Safari / TV included) - no Web Audio.
     vizActive = true;
     const hint = document.getElementById('viz-hint');
-    if (hint) { hint.textContent = 'Starting visualizer…'; hint.style.opacity = '1'; }
-    vizBuildGraph();
-    // AudioContext often starts suspended until a user gesture. Switching to
-    // this mode is usually itself a gesture, but not always (e.g. mode set via
-    // URL on load). Resume now, and ALSO arm a one-time gesture listener so a
-    // tap/click anywhere guarantees the context (and thus the analyser data)
-    // wakes up. Without this the bars can sit dead with the autoplay warning.
-    vizResume();
-    if (!vizGestureArmed) {
-      vizGestureArmed = true;
-      const wake = () => { vizResume(); };
-      window.addEventListener('pointerdown', wake, { once: false });
-      window.addEventListener('keydown', wake, { once: false });
-      document.addEventListener('visibilitychange', () => { if (!document.hidden) vizResume(); });
-      window.addEventListener('focus', wake);
-    }
+    if (hint) { hint.textContent = 'Connecting to server visualizer...'; hint.style.opacity = '1'; }
+    if (VIZ_CFG && VIZ_CFG.smoothing) vizApplySmoothing(VIZ_CFG.smoothing);
+    vizServerConnect();
     vizSizeCanvas();
     vizWireTuner();
-    if (VIZ_CFG && VIZ_CFG.smoothing) vizApplySmoothing(VIZ_CFG.smoothing);
     if (VIZ_CFG && VIZ_CFG.style && VIZ_STYLES.indexOf(VIZ_CFG.style) >= 0 && !vizStyleTouched) {
       vizStyle = VIZ_CFG.style;
     }
     vizUpdateStyleLabel();
     vizShowTuner();
-    if (lastSnap) vizSync(lastSnap);
     if (!vizRAF) vizRAF = requestAnimationFrame(vizDraw);
-  }
-
-  function vizResume() {
-    if (vizCtx && vizCtx.state === 'suspended') {
-      vizCtx.resume().then(() => {
-        const el = vizAudio();
-        if (vizActive && el && el.paused && vizRoomState) el.play().catch(()=>{});
-      }).catch(()=>{});
-    }
   }
 
   function vizStop() {
     vizActive = false;
     if (vizRAF) { cancelAnimationFrame(vizRAF); vizRAF = 0; }
-    clearTimeout(vizStreamTimeout);
     const t = document.getElementById('viz-tuner');
     if (t) t.hidden = true;
     clearTimeout(vizTunerHideTimer);
-    const el = vizAudio();
-    if (el) { try { el.pause(); el.playbackRate = 1.0; } catch(e){} el.removeAttribute('src'); el.load(); }
-    vizTrackId = null;
-    if (vizCtx && vizCtx.state === 'running') vizCtx.suspend().catch(()=>{});
     vizServerDisconnect();
   }
 
-  // Called every poll while in visualizer mode. Rather than continuously
-  // chasing the room (which stutters) or seeking only once (which drifts), we
-  // RE-ANCHOR precisely on the events that actually break sync — track change,
-  // track restart, a room seek, and a pause->play resume — and free-run
-  // smoothly between them. These are exactly the moments sync was being lost.
-  function vizSync(d) {
-    if (!vizActive || !d) return;
-    // Server mode: nothing to sync locally — the audio is being decoded on the
-    // server by the headless Visualizer player and the bridge sends bands.
-    if (vizIsServerMode()) return;
-    const el = vizAudio();
-    if (!el) return;
-    const tid = d.track_id;
-    const playing = d.state === 'playing';
-    const pos = d.position || 0;
-
-    const isLocal = tid !== undefined && tid !== null && tid !== '' && /^\d+$/.test(String(tid));
-    if (!isLocal) {
-      // Remote/streaming track. The resolved CDN URL isn't in the poll payload
-      // (that would touch the live song object every 2.5s); we fetch it ONCE
-      // per track from the /streamurl endpoint. tid identifies the track (even
-      // for remote tracks it's a stable negative id), so we refetch only when
-      // it changes.
-      if (String(tid) !== String(vizRemoteTid)) {
-        vizRemoteTid = String(tid);
-        vizStreamUrl = '';
-        vizTrackId = null;
-        const pid = (lastSnap && lastSnap.player && lastSnap.player.id) || currentPlayer || 'auto';
-        vizHint('Resolving stream…');
-        fetch(`${BASE}/plugins/NowPlayingDisplay/streamurl?player=${encodeURIComponent(pid)}`)
-          .then(r => r.json())
-          .then(j => {
-            if (String(tid) !== String(vizRemoteTid)) return;  // track moved on
-            const su = (j && j.url) || '';
-            if (!su) { vizHint('Visualizer is only available for local library tracks'); return; }
-            vizStreamUrl = su;
-            const myTid = String(tid);
-            const needsProxy = !!(j && j.needsProxy);
-            const proxySig = (j && j.sig) || '';
-            // The server tells us, by source protocol, whether this stream is
-            // CORS-blocked and must go through our same-origin proxy. Qobuz
-            // plays direct (CORS-friendly); Bandcamp/RP use the proxy. This is
-            // deterministic — no runtime timing/error guessing. The proxy is
-            // HMAC-gated: only URLs the server itself issued (with a matching
-            // signature) will be relayed — prevents the endpoint from being
-            // used as an open SSRF proxy.
-            const loadSrc = needsProxy
-              ? `${BASE}/plugins/NowPlayingDisplay/streamproxy?url=${encodeURIComponent(su)}&sig=${encodeURIComponent(proxySig)}`
-              : su;
-
-            const cleanup = () => {
-              el.removeEventListener('canplay', onReady);
-              el.removeEventListener('error', onError);
-            };
-            const onReady = () => {
-              if (String(tid) !== myTid) { cleanup(); return; }
-              clearTimeout(vizStreamTimeout);
-              cleanup();
-              if (vizRoomState) el.play().catch(()=>{});
-              vizHint('');
-            };
-            const onError = () => {
-              if (String(tid) !== myTid) { cleanup(); return; }
-              clearTimeout(vizStreamTimeout);
-              cleanup();
-              vizStreamUrl = '';
-              vizHint('This stream can\u2019t be visualized');
-            };
-
-            el.addEventListener('canplay', onReady);
-            el.addEventListener('error', onError);
-            // crossOrigin is needed ONLY for the genuinely cross-origin direct
-            // path (Qobuz CDN, which sends CORS headers). The proxy is
-            // same-origin, so we must NOT set it there — Safari would taint a
-            // same-origin element that has crossOrigin set. (Even though the
-            // proxy sends ACAO:*, clearing the attribute is the safe choice and
-            // matches the local-file handling.)
-            if (needsProxy) {
-              el.removeAttribute('crossorigin');
-            } else {
-              el.crossOrigin = 'anonymous';
-            }
-            el.src = loadSrc;
-            el.load();
-
-            // For proxied streams, a continuous live stream (RP "regular") never
-            // finishes buffering so canplay never fires — watchdog nudges toward
-            // the interactive/FLAC channel.
-            if (needsProxy) {
-              clearTimeout(vizStreamTimeout);
-              vizStreamTimeout = setTimeout(() => {
-                if (String(tid) === myTid && (!el.readyState || el.readyState < 2)) {
-                  cleanup();
-                  try { el.removeAttribute('src'); el.load(); } catch(e){}
-                  vizStreamUrl = '';
-                  vizHint('This continuous stream can\u2019t be visualized — try the interactive/FLAC version of the channel');
-                }
-              }, 8000);
-            }
-          })
-          .catch(() => { vizHint('Visualizer is only available for local library tracks'); });
-      }
-      // Mirror play/pause for an already-loaded stream.
-      if (vizStreamUrl) {
-        if (playing) { if (el.paused && el.readyState >= 2) el.play().catch(()=>{}); }
-        else { if (!el.paused) el.pause(); }
-      }
-      vizRoomState = playing;
-      return;
-    }
-    // Local track — clear any remote-stream state.
-    if (vizStreamUrl || vizRemoteTid) { vizStreamUrl = ''; vizRemoteTid = null; clearTimeout(vizStreamTimeout); }
-
-    // Work out whether something discontinuous happened to the room since the
-    // last poll. If it was playing, we expect position to have advanced by
-    // about the elapsed wall-clock time. A large mismatch means a seek or a
-    // restart; a backward jump means a restart/seek-back.
-    const nowMs = performance.now();
-    let expectedPos = vizRoomPos;
-    if (vizRoomState && vizRoomPosAt) {
-      expectedPos = vizRoomPos + (nowMs - vizRoomPosAt) / 1000;
-    }
-    const jumped = Math.abs(pos - expectedPos) > 1.5;     // seek/restart
-    const trackChanged = String(tid) !== String(vizTrackId);
-    const wentDown = pos + 0.5 < expectedPos;             // position fell back
-
-    // Update our anchor sample to the freshest poll values.
-    vizRoomPos   = pos;
-    vizRoomPosAt = nowMs;
-    vizRoomState = playing;
-
-    // --- Track change: load the new file, anchor on canplay ---
-    if (trackChanged) {
-      vizTrackId = String(tid);
-      // Same-origin local file: do NOT set crossOrigin. Safari taints a
-      // same-origin media element that has crossOrigin set if the response
-      // lacks CORS headers (LMS's /music/ endpoint doesn't send them), which
-      // silences the analyser even though audio plays. Clearing it here also
-      // resets any value left over from a previous streaming track.
-      el.removeAttribute('crossorigin');
-      el.src = `${BASE}/music/${vizTrackId}/download.mp3`;
-      el.load();
-      vizHint('');
-      const onReady = () => {
-        el.removeEventListener('canplay', onReady);
-        vizSeekTo(vizEstimatedRoomPos() + vizLeadSeconds());
-        if (vizRoomState) el.play().catch(()=>{});
-      };
-      el.addEventListener('canplay', onReady);
-      return;   // play/pause + anchor handled on canplay
-    }
-
-    // --- Re-anchor only when the POSITION actually moved discontinuously ---
-    // (restart of same track, or a seek). A plain pause->play does NOT move the
-    // position, so we must NOT seek on resume — seeking re-buffers the MP3 and
-    // causes a multi-second stall. On a clean resume we just un-pause below and
-    // both clocks continue from where they paused, still aligned.
-    if ((jumped || wentDown) && el.readyState >= 2) {
-      vizSeekTo(pos + vizLeadSeconds());
-    }
-
-    // --- Mirror play/pause ---
-    if (playing) {
-      if (el.paused && el.readyState >= 2) el.play().catch(()=>{});
-    } else {
-      if (!el.paused) el.pause();
-    }
-  }
-
-  // Estimate the room's current playback position by extrapolating from the
-  // last poll sample (position advances in real time while playing).
-  function vizEstimatedRoomPos() {
-    if (!vizRoomState) return vizRoomPos;
-    return vizRoomPos + (performance.now() - vizRoomPosAt) / 1000;
-  }
-
-  // Drift safety-net. Event re-anchoring (in vizSync) handles the big sync
-  // breakers; this only catches SLOW drift accumulating over a long track from
-  // the two clocks running at fractionally different rates. Rare and gentle so
-  // it never fights the event anchoring or stutters the display.
-  function vizCorrect() {
-    const el = vizAudio();
-    if (!el || !vizActive || el.paused || el.readyState < 2) return;
-    if (vizTrackId === null) return;
-    if (el.playbackRate !== 1.0) el.playbackRate = 1.0;
-    const now = performance.now();
-    if (now - vizLastSeek < 8000) return;        // at most every 8s
-    const target = vizEstimatedRoomPos() + vizLeadSeconds();
-    if (!isFinite(el.currentTime)) return;
-    // Only correct sustained drift beyond ~0.5s — tighter than before (since
-    // we're not constantly seeking) but still rare enough to stay smooth.
-    if (Math.abs(el.currentTime - target) > 0.5) vizSeekTo(target);
-  }
 
   // Visualizer offset resolution. Config injected from settings holds a
   // per-player offset map plus a global default. We resolve the offset for
@@ -5282,13 +5054,6 @@ sub _pageHtml { return <<'HTML'; }
     } catch (e) {}
     if (isNaN(ms)) ms = 0;
     return ms / 1000;
-  }
-
-  function vizSeekTo(t) {
-    const el = vizAudio();
-    if (!el) return;
-    try { el.currentTime = Math.max(0, t); } catch(e){}
-    vizLastSeek = performance.now();
   }
 
   let vizHintIsStart = false;
@@ -5342,20 +5107,14 @@ sub _pageHtml { return <<'HTML'; }
 
   function vizNudge(delta) {
     if (vizTuneMs === null) vizTuneMs = vizCurrentOffsetMs();
-    vizTuneMs = Math.max(-2000, Math.min(2000, vizTuneMs + delta));
+    // Delay-only: 0 = passthrough (live edge), up to +2000ms of visual delay.
+    vizTuneMs = Math.max(0, Math.min(2000, vizTuneMs + delta));
     vizUpdateTunerLabel();
     vizShowTuner();
-    // Browser-audio mode: re-seek the local audio element so the shift is
-    // visible immediately against the music. (No-op if the element isn't
-    // playing — e.g. server-mode pages or iOS Safari.)
-    const el = vizAudio();
-    if (el && el.readyState >= 2 && vizTrackId !== null) {
-      vizSeekTo(vizEstimatedRoomPos() + vizTuneMs / 1000);
-    }
-    // Server mode: push the new offset to the helper via the plugin's
-    // transient-offset endpoint. The helper polls its offset file every
-    // 100ms; next frame uses the new value. Doesn't persist — only Save
-    // does that (via vizSaveOffset, which hits /setoffset).
+    // Push the new offset to the helper via the plugin's transient-offset
+    // endpoint. The helper polls its offset file every 100ms; next frame uses
+    // the new value. Doesn't persist — only Save does that (via vizSaveOffset,
+    // which hits /setoffset).
     fetch(`${BASE}/plugins/NowPlayingDisplay/setlivenoffset?ms=${vizTuneMs}`,
           { method: 'GET', cache: 'no-store' }).catch(() => {});
   }
@@ -5428,21 +5187,29 @@ sub _pageHtml { return <<'HTML'; }
   let calActivePlayerId = null; // player MAC the tone is playing on
   let calSafetyTimer = 0;
 
-  // --- Calibration animation state (the "ball drops on a moving block" A/V
-  // sync view). It detects each 1Hz beep in the incoming (offset-DELAYED)
-  // captured audio and fires the impact on that detected instant, so as you
-  // change the offset the impact slides relative to the beep you hear from the
-  // room. You tune until the ball strikes / the screen flashes exactly when you
-  // hear the beep — that's the room's offset.
-  let calLastOnset  = 0;        // performance.now() of last detected beep
-  let calPeriod     = 1000;     // ms between beeps (EMA; tone is 1Hz)
+  // --- Calibration animation state (the bouncing-ball A/V sync view).
+  // It detects each ~1Hz beep in the incoming (offset-DELAYED) captured audio —
+  // i.e. exactly the audio the visualizer renders during normal music — and:
+  //   • flashes on the REAL detected beep (immediate: nudge the offset and the
+  //     flash moves at once, relative to the beep you hear from the room), and
+  //   • bounces the ball on a CONTINUOUS beat phase that's gently pulled toward
+  //     the beeps (a PLL). The ball descends on this phase (smooth anticipation)
+  //     and strikes the floor at the beep. Unlike the old design — which hard-
+  //     reset the bounce to every detection, so it teleported and the offset's
+  //     effect was masked — the phase only ever moves continuously.
+  // You tune the offset until the ball strikes / screen flashes exactly when you
+  // HEAR the beep. (No room-clock tracking — your ears are the reference, same
+  // as judging whether the bars hit the beat while music plays.)
+  let calLastOnset  = 0;        // performance.now() of last detected beep (refractory + period)
+  let calPeriod     = 1000;     // ms between beeps (gentle EMA; tone is ~1Hz)
   let calArmed      = true;     // hysteresis: ready to detect next rising edge
   let calFlashUntil = 0;        // impact flash decays until this time
-  let calSwap       = false;    // ball/block colour swap toggle (per impact)
   let calOnsetCount = 0;        // beeps seen since calibration started
+  let calPhase      = 0;        // continuous beat phase; integer = floor strike
+  let calPhaseT     = 0;        // performance.now() of last phase advance
   function vizCalReset() {
     calLastOnset = 0; calPeriod = 1000; calArmed = true;
-    calFlashUntil = 0; calSwap = false; calOnsetCount = 0;
+    calFlashUntil = 0; calOnsetCount = 0; calPhase = 0; calPhaseT = 0;
   }
 
   function vizCalPlayerId() {
@@ -5541,6 +5308,14 @@ sub _pageHtml { return <<'HTML'; }
     bind('viz-tstyle',  vizCycleStyle);
     bind('viz-tcal1k',  () => vizCalToggle('1khz'));
     bind('viz-tcal200', () => vizCalToggle('200hz'));
+    bind('viz-ttest',   vizRunSelfTest);
+    bind('viz-st-close', () => {
+      const p = document.getElementById('viz-selftest'); if (p) p.hidden = true;
+    });
+    bind('viz-lead-minus', () => vizNudgeLead(-50));
+    bind('viz-lead-plus',  () => vizNudgeLead(50));
+    if (VIZ_CFG && typeof VIZ_CFG.leadMs === 'number') vizLeadMs = VIZ_CFG.leadMs | 0;
+    vizUpdateLeadLabel();
     // Tap anywhere in the visualizer reveals the tuner.
     const sec = document.querySelector('.mode.visualizer');
     if (sec) sec.addEventListener('pointerdown', (e) => {
@@ -5568,7 +5343,8 @@ sub _pageHtml { return <<'HTML'; }
   // Per-octave tilt to counter music's bass-heavy roll-off, pivoting around
   // VIZ_TILT_PIVOT_HZ: bands below it are cut, bands above are boosted, by this
   // many dB per octave from the pivot. 0 = raw/untilted.
-  const VIZ_TILT_DB_PER_OCT = 3.0;
+  const VIZ_TILT_DB_PER_OCT = 4.0;   // was 3.0; steepened to pull the low-mids
+                                     // (~240Hz & below) down and lift the highs
   const VIZ_TILT_PIVOT_HZ   = 1000;   // ~geometric centre of 50Hz–20kHz
 
   // Uniform ballistics applied per DISPLAY bar (not per FFT bin), so every bar
@@ -5627,18 +5403,30 @@ sub _pageHtml { return <<'HTML'; }
       for (let i = 0; i < vizServerFrame.length; i++) if (vizServerFrame[i] > mx) mx = vizServerFrame[i];
       level = Math.max(0, (mx + 80) / 80);                  // crude dB->0..1
     }
+    // --- Advance the continuous beat phase (free-runs at 1 / period) ---
+    if (calPhaseT === 0) calPhaseT = now;
+    let pdt = now - calPhaseT; calPhaseT = now;
+    if (pdt < 0) pdt = 0; else if (pdt > 250) pdt = 250;   // clamp tab-switch gaps
+    calPhase += pdt / calPeriod;
+
+    // --- Onset detection (+ PLL phase correction) ---
     const ON = 0.06, OFF = 0.03;                            // hysteresis thresholds
     const REFRACTORY = 450;                                 // ms; beeps are ~1000ms apart
     if (calArmed && level > ON && (now - calLastOnset) > REFRACTORY) {
       if (calLastOnset > 0) {
         const dt = now - calLastOnset;
-        if (dt > 600 && dt < 1600) calPeriod += (dt - calPeriod) * 0.3;   // EMA toward true 1Hz
+        if (dt > 600 && dt < 1600) calPeriod += (dt - calPeriod) * 0.15;  // gentle ~1Hz lock
       }
       calLastOnset = now;
-      calFlashUntil = now + 150;     // crisp impact flash
-      calSwap = !calSwap;
+      calFlashUntil = now + 150;     // crisp flash on the REAL beep (immediate)
       calOnsetCount++;
       calArmed = false;
+      // Pull the phase toward the strike (nearest integer). Signed distance,
+      // corrected 50% per beep — fast enough that an offset nudge visibly moves
+      // the strike within a beat or two, smooth enough that it never teleports.
+      const frac = calPhase - Math.floor(calPhase);
+      const err  = (frac > 0.5) ? (frac - 1) : frac;
+      calPhase -= err * 0.5;
     } else if (!calArmed && level < OFF) {
       calArmed = true;               // re-arm once the beep has died away
     }
@@ -5648,42 +5436,19 @@ sub _pageHtml { return <<'HTML'; }
     const floorY = H * 0.72;
     const ballR = Math.max(10, H * 0.045);
     const COL_BALL = '#4fb0d0';      // theme cyan
-    const COL_BLOCK = '#e8943a';     // orange
-    const ballCol  = calSwap ? COL_BLOCK : COL_BALL;
-    const blockCol = calSwap ? COL_BALL  : COL_BLOCK;
-
-    // Predicted next impact (phase-locked to detected beeps). Until we've seen
-    // the first beep, just park the ball at the top.
     const haveLock = calOnsetCount > 0;
-    const nextImpact = calLastOnset + calPeriod;
 
-    // Block slides left->right, passing through centre exactly at impact.
-    const blockW = Math.max(60, W * 0.10), blockH = Math.max(18, H * 0.03);
-    const span = W * 0.5;
-    let blockCx = cx;
+    // Ball bounces on the CONTINUOUS phase: floor at integer phase (the strike),
+    // apex at the half. Because the phase only ever moves continuously (the PLL
+    // nudge above is small), the ball never teleports — it just bounces, and the
+    // strike instant slides smoothly as you change the offset.
+    const apexY = H * 0.10;
+    const restY = floorY - ballR;
+    let ballY = restY;
     if (haveLock) {
-      const speed = (span * 2) / calPeriod;                 // px/ms across 2*span per period
-      blockCx = cx + ((now - nextImpact) * speed);
-      // wrap into [cx-span, cx+span]
-      const range = span * 2;
-      blockCx = cx - span + (((blockCx - (cx - span)) % range) + range) % range;
-    }
-
-    // Ball bounces continuously: it strikes the floor exactly at each impact,
-    // rising back up in between — one smooth down-up cycle per beep, never
-    // teleporting. Phase 0 and 1 are both at the floor (impact); phase 0.5 is
-    // the apex. We use the time since the last impact, wrapped by the period.
-    let ballY = H * 0.12;
-    if (haveLock) {
-      const apexY = H * 0.10;
-      const restY = floorY - ballR;
-      // phase: 0 at last impact, climbs to 1 at next impact
-      let ph = (now - calLastOnset) / calPeriod;
-      ph = ((ph % 1) + 1) % 1;
-      // Symmetric path: floor -> apex -> floor. Ease so it slows at the top
-      // (gravity) and meets the floor crisply at both ends.
-      const u = 1 - Math.abs(2 * ph - 1);        // 0 at floor, 1 at apex, 0 at floor
-      const eased = Math.sin((u * Math.PI) / 2); // slow at apex, fast near floor
+      const ph = calPhase - Math.floor(calPhase);  // 0..1
+      const u = 1 - Math.abs(2 * ph - 1);          // 0 at floor, 1 at apex, 0 at floor
+      const eased = Math.sin((u * Math.PI) / 2);   // slow at apex, fast near floor
       ballY = restY + (apexY - restY) * eased;
     }
 
@@ -5696,21 +5461,23 @@ sub _pageHtml { return <<'HTML'; }
     vizG.lineWidth = Math.max(2, H * 0.004);
     vizG.beginPath(); vizG.moveTo(0, floorY); vizG.lineTo(W, floorY); vizG.stroke();
 
-    // Big flash circle, lower-left, fires on impact
+    // Strike marker: a faint fixed pad on the floor where the ball lands, so the
+    // eye has one fixed spot to watch the strike against the beep you hear.
+    vizG.fillStyle = 'rgba(255,255,255,0.10)';
+    const padW = ballR * 2.8, padH = Math.max(4, H * 0.006);
+    vizG.fillRect(cx - padW / 2, floorY - padH, padW, padH);
+
+    // Big flash circle, lower-left, fires on the REAL detected beep
     const fr = H * 0.14;
     vizG.beginPath();
     vizG.arc(W * 0.13, floorY, fr, 0, Math.PI * 2);
     vizG.fillStyle = flashing ? `rgba(255,255,255,${0.85 * flashK})` : 'rgba(255,255,255,0.06)';
     vizG.fill();
 
-    // Moving block on the floor
-    vizG.fillStyle = blockCol;
-    vizG.fillRect(blockCx - blockW / 2, floorY - blockH, blockW, blockH);
-
     // Ball
     vizG.beginPath();
     vizG.arc(cx, ballY, ballR, 0, Math.PI * 2);
-    vizG.fillStyle = ballCol;
+    vizG.fillStyle = COL_BALL;
     vizG.fill();
 
     // Full-screen impact wash (brief)
@@ -5724,7 +5491,7 @@ sub _pageHtml { return <<'HTML'; }
     vizG.font = `${Math.max(12, H * 0.022)}px system-ui, sans-serif`;
     vizG.textAlign = 'center';
     const msg = haveLock
-      ? 'Tune the offset until the flash lands on the beep you hear'
+      ? 'Tune the offset until the ball strikes exactly when you hear the beep'
       : 'Waiting for calibration tone\u2026';
     vizG.fillText(msg, cx, H * 0.94);
     vizG.textAlign = 'start';
@@ -5735,23 +5502,16 @@ sub _pageHtml { return <<'HTML'; }
     vizRAF = requestAnimationFrame(vizDraw);
     if (!vizG) return;
 
-    const serverMode = vizIsServerMode();
-    // Browser-audio mode requires the analyser to be live; server mode renders
-    // from the WebSocket-supplied band values and has no analyser/context.
-    if (!serverMode && !vizAnalyser) return;
-
-    // If the AudioContext is still suspended (browsers start it that way until
-    // a user gesture), keep trying to resume every frame. Only meaningful in
-    // browser-audio mode — server mode has no AudioContext.
-    if (!serverMode) {
-      if (vizCtx && vizCtx.state === 'suspended') {
-        vizResume();
-        vizHint('Tap to start the visualizer');
-      } else if (vizCtx && vizCtx.state === 'running' && vizHintIsStart) {
-        vizHint('');   // clear the start hint once running
-      }
-      vizCorrect();   // keep audio position locked to room + offset
+    // System-delay self-test: this paint is the first since a frame arrived, so
+    // (now - arrival) is the receive->draw latency for that frame. Sampled only
+    // while a test is running; negligible cost otherwise.
+    if (vizFramePend) {
+      vizFramePend = false;
+      if (vizSelftest) vizSelftest.draw.push(performance.now() - vizFrameRecvT);
     }
+
+    // Server-driven: nothing to drive locally — we render whatever frame the
+    // helper last streamed over the WebSocket (vizServerFrame / vizServerWave).
 
     const W = vizCanvas.width, H = vizCanvas.height;
     vizG.clearRect(0, 0, W, H);
@@ -5792,12 +5552,9 @@ sub _pageHtml { return <<'HTML'; }
     if (dt < VIZ_UPDATE_MS && vizLevels) return (vizLevels ? vizLevels.length : VIZ_BARS);
     vizLastCompute = now;
 
-    // SERVER MODE: bin data comes from our own FFT helper (npd-vizfft.py)
-    // as dB-per-bin values, like getFloatFrequencyData() would give. We run
-    // THE SAME log-binning + tilt + dB-curve + ballistics as the browser-
-    // audio path below, with the same constants — so the look matches the
-    // original Bars exactly. Only the data source differs.
-    if (vizIsServerMode()) {
+    // Bin data comes from our FFT helper (npd-vizfft.py) as dB-per-bin values,
+    // like getFloatFrequencyData() would give. Log-binning + tilt + dB-curve +
+    // ballistics give the original Bars look from the server-streamed frame.
       const bars = VIZ_BARS;
       if (!vizLevels || vizLevels.length !== bars) vizLevels = new Float32Array(bars);
       if (!vizPeaks  || vizPeaks.length  !== bars) vizPeaks  = new Float32Array(bars);
@@ -5855,71 +5612,6 @@ sub _pageHtml { return <<'HTML'; }
         else vizPeaks[i] = Math.max(v, vizPeaks[i] - peakDrop);
       }
       return bars;
-    }
-
-    // Scale factor relative to a 60fps frame (16.7ms). Clamp so a long stall
-    // (e.g. tab backgrounded) can't produce a huge jump.
-    const fscale = Math.min(4, dt / 16.7);
-    vizAnalyser.getFloatFrequencyData(vizData);
-
-    const bins   = vizData.length;
-    const nyq    = (vizCtx ? vizCtx.sampleRate : 44100) / 2;
-    const hzPer  = nyq / bins;
-    const fMin   = 50;
-    const fMax   = Math.min(20000, nyq);
-    const bars   = VIZ_BARS;
-    const logMin = Math.log10(fMin);
-    const logMax = Math.log10(fMax);
-    const span   = VIZ_DB_CEIL - VIZ_DB_FLOOR;
-
-    if (!vizLevels || vizLevels.length !== bars) vizLevels = new Float32Array(bars);
-    if (!vizPeaks  || vizPeaks.length  !== bars) vizPeaks  = new Float32Array(bars);
-
-    // Convert the per-frame attack/decay fractions into time-scaled rates.
-    // 1-(1-r)^fscale gives the equivalent fraction over `fscale` frames.
-    const aRate = 1 - Math.pow(1 - VIZ_ATTACK, fscale);
-    const dRate = 1 - Math.pow(1 - VIZ_DECAY,  fscale);
-    const peakDrop = VIZ_PEAK_DECAY * fscale;
-
-    for (let i = 0; i < bars; i++) {
-      const f0 = Math.pow(10, logMin + (i     / bars) * (logMax - logMin));
-      const f1 = Math.pow(10, logMin + ((i+1) / bars) * (logMax - logMin));
-      let b0 = Math.floor(f0 / hzPer);
-      let b1 = Math.max(b0 + 1, Math.ceil(f1 / hzPer));
-      if (b1 > bins) b1 = bins;
-      let power = 0, nb = 0;
-      for (let b = b0; b < b1; b++) {
-        const db = vizData[b];
-        if (db === -Infinity || isNaN(db)) continue;
-        power += Math.pow(10, db / 10);
-        nb++;
-      }
-      // Average power per bin (not sum). Summing would massively favour the
-      // wide treble bands (which span 50-240 bins) over the narrow bass bands
-      // (2-3 bins), making the high end read artificially boosted. Averaging
-      // gives each band its true level regardless of how many bins it spans.
-      const avgPower = nb > 0 ? power / nb : 0;
-      let bandDb = avgPower > 0 ? 10 * Math.log10(avgPower) : -Infinity;
-
-      // Spectral tilt, pivoting around the spectrum CENTRE so it both CUTS the
-      // bass and BOOSTS the treble (a bottom-anchored tilt only lifts highs and
-      // leaves the bass as high as before). Bands below centre are attenuated,
-      // bands above are lifted, by VIZ_TILT_DB_PER_OCT per octave from centre.
-      const fc = Math.sqrt(f0 * f1);                 // band centre (geometric)
-      const octFromCentre = Math.log2(fc / VIZ_TILT_PIVOT_HZ);
-      bandDb += VIZ_TILT_DB_PER_OCT * octFromCentre;
-
-      let target = (bandDb - VIZ_DB_FLOOR) / span;
-      if (!isFinite(target) || target < 0) target = 0;
-      if (target > 1) target = 1;
-      const cur = vizLevels[i];
-      const rate = (target > cur) ? aRate : dRate;
-      const v = cur + (target - cur) * rate;
-      vizLevels[i] = v;
-      if (v >= vizPeaks[i]) vizPeaks[i] = v;
-      else vizPeaks[i] = Math.max(v, vizPeaks[i] - peakDrop);
-    }
-    return bars;
   }
 
   // ----- Style 1: segmented LED spectrum (the Eversolo look) -----
@@ -6213,18 +5905,13 @@ sub _pageHtml { return <<'HTML'; }
   // Centralised so Scope and the four Ring variants stay simple and don't each
   // need their own mode dispatch.
   function vizPopulateWave() {
-    if (vizIsServerMode()) {
-      if (!vizServerWave) return false;
-      // Reallocate vizWave to match the server's wave length the first time we
-      // see it. Same-shape Float32Array thereafter, copied in by index — cheap.
-      if (!vizWave || vizWave.length !== vizServerWave.length) {
-        vizWave = new Float32Array(vizServerWave.length);
-      }
-      vizWave.set(vizServerWave);
-      return true;
+    if (!vizServerWave) return false;
+    // Reallocate vizWave to match the server's wave length the first time we
+    // see it. Same-shape Float32Array thereafter, copied in by index — cheap.
+    if (!vizWave || vizWave.length !== vizServerWave.length) {
+      vizWave = new Float32Array(vizServerWave.length);
     }
-    if (!vizWave || !vizAnalyser) return false;
-    vizAnalyser.getFloatTimeDomainData(vizWave);
+    vizWave.set(vizServerWave);
     return true;
   }
 
@@ -6311,20 +5998,11 @@ sub _pageHtml { return <<'HTML'; }
     // 50-67 Hz with the 20-bar log binning from 50 Hz). Narrow band = highly
     // selective — only deep kick fundamentals trigger it, not broader bass.
     //
-    // Source-agnostic: in web-audio mode we refresh vizData via the analyser
-    // and read its bins; in server mode the same shape of data already arrived
-    // over the WebSocket in vizServerFrame. Either way it's a dB-per-bin array,
-    // so the kick-finding logic is identical once we've picked the source.
+    // dB-per-bin data arrives over the WebSocket in vizServerFrame.
     let dbBins = null, binHz = 0;
-    if (vizIsServerMode()) {
-      if (vizServerFrame && vizServerBinHz) {
-        dbBins = vizServerFrame;
-        binHz  = vizServerBinHz;
-      }
-    } else if (vizData && vizAnalyser) {
-      vizAnalyser.getFloatFrequencyData(vizData);
-      dbBins = vizData;
-      binHz  = (vizCtx ? vizCtx.sampleRate : 44100) / 2 / vizData.length;
+    if (vizServerFrame && vizServerBinHz) {
+      dbBins = vizServerFrame;
+      binHz  = vizServerBinHz;
     }
     if (dbBins && binHz) {
       const kLo = Math.max(1, Math.floor(50 / binHz));

@@ -33,6 +33,8 @@ import hashlib
 import math
 import mmap
 import os
+import json
+import select
 import socket
 import struct
 import sys
@@ -317,46 +319,81 @@ def compute_magnitude_bins(samples_mono):
 # Shared latest-frame state
 # ---------------------------------------------------------------------------
 
-_latest = {"frame": "", "rate": 44100}
+_latest = {"frame": "", "rate": 44100, "proc_ms": 0.0}
 _lock = threading.Lock()
 
 
-def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_ms=2000):
+def open_reader_with_retry(shm_name, retry_secs=1.0, log_every_secs=10.0):
+    """Open the SqueezeLite shmem, RETRYING until it appears.
+
+    The shmem segment only exists while SqueezeLite is running with -v. The
+    plugin starts SqueezeLite and this helper at roughly the same time, so on a
+    cold start the segment may not be there for the first second or two — and
+    the user may legitimately stop SqueezeLite when idle and start it later.
+    Previously a missing segment raised in ShmemReader.__init__ and killed the
+    producer thread for good (the WS thread kept the process alive, so the
+    plugin's supervisor never restarted it → permanently blank). Instead we
+    wait and retry forever, so the visualizer heals itself whenever SqueezeLite
+    (re)appears, with no manual helper restart needed.
+    """
+    waited = 0.0
+    last_log = -1e9
+    while True:
+        try:
+            return ShmemReader(shm_name)
+        except (FileNotFoundError, OSError, RuntimeError) as e:
+            if (waited - last_log) >= log_every_secs:
+                print(f"[vizfft] waiting for shmem /dev/shm/{shm_name.lstrip('/')} "
+                      f"(SqueezeLite not up yet?): {e}", flush=True)
+                last_log = waited
+            time.sleep(retry_secs)
+            waited += retry_secs
+
+
+def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=2000, baseline_ms=0):
     """Read shmem -> accumulate into Python ring -> offset-aware FFT -> serialise.
 
     The Python ring buffer gives us a much deeper history than squeezelite's
     shmem ring (which is fixed at ~186ms). This lets the FFT window be read
     from up to `max_offset_ms` of audio history back, so the visualizer can
-    be time-shifted to align with rooms whose playback latency is much
-    larger than the shmem ring (WISA systems, bridges with deep buffering).
+    be DELAYED to align with rooms whose playback latency is larger than the
+    Visualizer's own capture (which is tuned to run ahead of every room).
 
     The current offset (in ms) is read from `offset_file` periodically. The
     plugin writes that file on user nudge / save / room change.
 
+    DELAY-ONLY offset model (re-spec, server-mode only):
+      offset 0   -> read at the live capture edge: zero added latency, the
+                    "passthrough" starting point. The visuals naturally lead
+                    the room here (capture runs ahead).
+      offset +N  -> read N ms further back -> the visuals are DELAYED by N ms,
+                    catching up to (and past) the room. This is the only
+                    direction ever needed; the room audio is never touched.
+    There is no negative side (we can't analyse audio the stream hasn't
+    produced yet), so the offset clamps to [0, max_offset_ms].
+
+    `baseline_ms` is retained as a CLI arg for compatibility but defaults to 0;
+    a non-zero baseline simply adds a constant lead to the read-back.
+
     Matches AnalyserNode.getFloatFrequencyData() byte-for-byte conceptually:
     Blackman window -> rfft -> magnitude -> smoothing 0.8 -> 20*log10.
     """
-    reader = ShmemReader(shm_name)
+    reader = open_reader_with_retry(shm_name)
     print(f"[vizfft] reading shmem: /dev/shm/{shm_name.lstrip('/')}")
     if offset_file:
         print(f"[vizfft] polling offset file: {offset_file}")
     sr_initial = reader.try_update_rate() or reader.sample_rate()
     print(f"[vizfft] initial sample rate: {sr_initial} Hz")
-    # Baseline lead: the visualizer renders audio `baseline_ms` back from the
-    # live capture edge by default, so the per-player offset is a BIDIRECTIONAL
-    # trim around it. Effective read-back from the live edge = baseline + offset:
-    #   offset 0      -> read `baseline_ms` back (neutral)
-    #   offset -N     -> read (baseline-N) back  -> visuals EARLIER (toward live)
-    #   offset +N     -> read (baseline+N) back  -> visuals LATER
-    # Forward limit is the baseline (offset -baseline = live edge). Clamp baseline
-    # into the ring so total read-back never exceeds what we buffer.
+    # Delay-only read-back: read_back = baseline + offset, clamped into the ring.
+    # With the default baseline of 0, offset 0 = live edge (passthrough) and a
+    # positive offset delays the visuals. Clamp baseline into the ring so total
+    # read-back never exceeds what we buffer.
     if baseline_ms < 0:
         baseline_ms = 0
     if baseline_ms > max_offset_ms:
         baseline_ms = max_offset_ms
-    print(f"[vizfft] baseline lead: {baseline_ms} ms "
-          f"(offset range {-baseline_ms}..{max_offset_ms - baseline_ms} ms; "
-          f"negative = visuals earlier, positive = later)")
+    print(f"[vizfft] delay-only: baseline={baseline_ms}ms, "
+          f"offset range 0..{max_offset_ms}ms (0 = live edge, positive = visuals delayed)")
     interval = 1.0 / fps
     silent_db = None
     smooth_mag = None
@@ -364,10 +401,13 @@ def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_
     # Python-side ring buffer for deep audio history. Sized for max_offset_ms
     # of audio at the HIGHEST supported rate, NOT the current one — otherwise a
     # ring sized at 44.1kHz would hold far less wall-clock history once playback
-    # switches to hi-res (e.g. only ~1s at 192kHz), silently clamping large
-    # offsets. Sizing for 192kHz guarantees the full max_offset_ms window holds
-    # at any rate we'll see. 4.5s @ 192kHz float32 = ~3.4MB — trivial.
-    RING_SIZE_RATE = 192000
+    # switches to hi-res. CRITICAL: this must be the true maximum in
+    # PLAUSIBLE_RATES (384kHz), not 192kHz — at 352.8/384kHz a full max_offset_ms
+    # window needs more samples than a 192kHz-sized ring holds, which (with the
+    # delay-only primed-check below) would leave the requested read point
+    # permanently unreachable and the visualizer blank. 2s @ 384kHz float32 =
+    # ~3.1MB — trivial.
+    RING_SIZE_RATE = max(PLAUSIBLE_RATES)   # 384000
     ring_size_samples = int((max_offset_ms / 1000.0) * RING_SIZE_RATE) + FFT_SIZE * 2
     ring = np.zeros(ring_size_samples, dtype=np.float32)
     ring_write = 0          # next write index in `ring`
@@ -413,28 +453,37 @@ def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_
             new_off = int(txt)
         except (OSError, ValueError):
             return
-        # Offset is now bidirectional. Forward (negative) is limited by the
-        # baseline lead (can't read past the live edge); backward (positive) by
-        # the ring depth beyond the baseline.
-        new_off = max(-baseline_ms, min(max_offset_ms - baseline_ms, new_off))
+        # Delay-only: offset clamps to [0, max_offset_ms - baseline]. We can't
+        # read past the live edge (negative), so 0 is the floor.
+        new_off = max(0, min(max_offset_ms - baseline_ms, new_off))
         if new_off != current_offset_ms:
             rb = baseline_ms + new_off
-            if rb < 0:
-                rb = 0
             # rb = how far behind the live capture edge the visuals are read,
-            # i.e. the visual latency this offset produces. 0 = live edge.
-            # This makes the sign explicit: negative offset -> smaller rb
-            # (visuals earlier/nearer live), positive -> larger rb (later).
+            # i.e. the visual delay this offset produces. 0 = live edge.
             print(f"[vizfft] offset updated: {current_offset_ms}ms -> {new_off}ms "
-                  f"(reading {rb}ms behind live edge; baseline={baseline_ms}ms)")
+                  f"(reading {rb}ms behind live edge; visuals delayed by {rb}ms)")
             current_offset_ms = new_off
         offset_file_mtime = m
 
     last_logged_sr = sr_initial
     overrun_total = 0
     last_overrun_log_t = 0.0
+
+    # NOTE: there is deliberately NO live "shmem changed → reconnect" check here.
+    # An earlier version re-opened the reader when the shmem inode changed, but
+    # the re-open path can BLOCK (open_reader_with_retry waits for the segment),
+    # which freezes the whole producer = black visualizer. The startup wait
+    # (open_reader_with_retry, above) is the only retry we need; if SqueezeLite is
+    # restarted while the helper runs, restart the helper (settings button) to
+    # reconnect. Stability > auto-recovering the rare mid-run restart.
+    # EMA of per-frame processing time (shmem-read -> FFT -> serialise), in ms.
+    # Surfaced to the page's system-delay self-test via the WS ping/pong so the
+    # known (measurable) part of the pipeline can be subtracted, leaving only the
+    # display-panel latency for the manual ball calibration to absorb.
+    proc_ms_ema = 0.0
     while True:
         try:
+            t_proc0 = time.perf_counter()
             now = time.time()
             sr = reader.try_update_rate() or reader.sample_rate()
             if sr != last_logged_sr:
@@ -491,22 +540,33 @@ def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_
                 paused_count = 0
             last_pause_idx = cur_idx
 
-            # Compute the FFT-read window. Read-back from the live edge is the
-            # baseline lead plus the (signed) offset, so 0 offset sits at the
-            # baseline, negative reads nearer the edge (visuals earlier), positive
-            # reads further back (visuals later). Clamp into [0, what we have].
+            # Compute the FFT-read window. Delay-only: read_back from the live
+            # edge = baseline + offset (offset >= 0), so 0 offset reads at the
+            # live edge (passthrough) and a positive offset reads further back
+            # (visuals delayed).
             read_back_ms = baseline_ms + current_offset_ms
             if read_back_ms < 0:
                 read_back_ms = 0
             read_back_samples = int(read_back_ms * sr / 1000)
-            max_available = max(0, ring_filled - FFT_SIZE)
-            if read_back_samples > max_available:
-                read_back_samples = max_available
+            # Defensive cap: never request a read point deeper than the ring can
+            # physically hold (can happen only if a rate above RING_SIZE_RATE
+            # ever appears). This is a CONSTANT per-rate ceiling — unlike the old
+            # `ring_filled - FFT_SIZE` clamp it does NOT grow as the ring fills,
+            # so it can't reintroduce the drift-into-sync. It just bounds the
+            # achievable delay so the primed-check below stays satisfiable.
+            max_read_back = ring_size_samples - FFT_SIZE
+            if read_back_samples > max_read_back:
+                read_back_samples = max_read_back
             offset_samples = read_back_samples
 
-            if ring_filled < FFT_SIZE:
-                # Ring hasn't accumulated enough history yet (just started).
-                # Emit silent frame so the visualizer doesn't show garbage.
+            # Primed-enough check. We need read_back_samples of history PLUS a
+            # full FFT window behind it. Until the ring holds that, emit a silent
+            # frame rather than reading a clamped-nearer-live window — clamping
+            # would make the visuals start at the live edge and visibly DRIFT
+            # back to the requested delay as the ring fills ("jumps into sync on
+            # its own"). At offset 0 the wait is just one FFT window (~186ms);
+            # for a non-zero per-room offset it's a one-time prime of that delay.
+            if ring_filled < (offset_samples + FFT_SIZE):
                 samples = np.zeros(FFT_SIZE, dtype=np.float32)
             else:
                 end_pos = (ring_write - offset_samples) % ring_size_samples
@@ -532,9 +592,12 @@ def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_
                     parts.extend([f"{DB_FLOOR:.1f}"] * OUT_BINS)
                     wave_part = ";".join(["0.000"] * WAVE_OUT_SAMPLES)
                     silent_db = ";".join(parts) + "|" + wave_part
+                dt = (time.perf_counter() - t_proc0) * 1000.0
+                proc_ms_ema = dt if proc_ms_ema == 0.0 else 0.8 * proc_ms_ema + 0.2 * dt
                 with _lock:
                     _latest["frame"] = silent_db
                     _latest["rate"]  = sr
+                    _latest["proc_ms"] = proc_ms_ema
                 smooth_mag = None
                 time.sleep(interval)
                 continue
@@ -564,9 +627,12 @@ def producer_loop(shm_name, fps, offset_file=None, max_offset_ms=4500, baseline_
             parts.extend(f"{v:.1f}" for v in db)
             wave_parts = [f"{v:.3f}" for v in wave_out]
             line = ";".join(parts) + "|" + ";".join(wave_parts)
+            dt = (time.perf_counter() - t_proc0) * 1000.0
+            proc_ms_ema = dt if proc_ms_ema == 0.0 else 0.8 * proc_ms_ema + 0.2 * dt
             with _lock:
                 _latest["frame"] = line
                 _latest["rate"]  = sr
+                _latest["proc_ms"] = proc_ms_ema
         except Exception as e:
             print(f"[vizfft] read/FFT error: {e}")
             time.sleep(0.5)
@@ -620,6 +686,73 @@ def ws_encode_text(message):
     return bytes(header) + payload
 
 
+def _recv_exact(conn, n):
+    """Read exactly n bytes (or return None on EOF/short read)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def ws_read_client_frame(conn):
+    """Read ONE WebSocket frame sent by the browser (client frames are masked).
+
+    Returns (opcode, payload_bytes), or (None, None) on close/EOF/parse error.
+    Only used for the self-test ping/pong + standard control frames — the data
+    path is server->client only, so this stays minimal (no fragmentation).
+    """
+    hdr = _recv_exact(conn, 2)
+    if hdr is None:
+        return (None, None)
+    b0, b1 = hdr[0], hdr[1]
+    opcode = b0 & 0x0F
+    masked = bool(b1 & 0x80)
+    length = b1 & 0x7F
+    if length == 126:
+        ext = _recv_exact(conn, 2)
+        if ext is None:
+            return (None, None)
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = _recv_exact(conn, 8)
+        if ext is None:
+            return (None, None)
+        length = struct.unpack(">Q", ext)[0]
+    if length > 65536:        # sanity cap — our control messages are tiny
+        return (None, None)
+    mask = b"\x00\x00\x00\x00"
+    if masked:
+        mask = _recv_exact(conn, 4)
+        if mask is None:
+            return (None, None)
+    payload = _recv_exact(conn, length) if length else b""
+    if payload is None:
+        return (None, None)
+    if masked:
+        payload = bytes(payload[i] ^ mask[i & 3] for i in range(len(payload)))
+    return (opcode, payload)
+
+
+def _handle_client_message(conn, payload):
+    """Reply to a browser control message. Currently just the self-test ping:
+    {"ping": <number>} -> {"pong": <number>, "proc_ms": <float>}. The browser
+    times the round trip (transport latency) and reads proc_ms (helper FFT
+    processing time) from the reply to build its system-delay budget."""
+    try:
+        msg = json.loads(payload.decode("utf-8", "ignore"))
+    except (ValueError, UnicodeError):
+        return
+    if not isinstance(msg, dict) or "ping" not in msg:
+        return
+    with _lock:
+        proc_ms = _latest.get("proc_ms", 0.0)
+    reply = json.dumps({"pong": msg["ping"], "proc_ms": round(proc_ms, 3)})
+    conn.send(ws_encode_text(reply))
+
+
 def client_thread(conn, addr, fps):
     try:
         if not ws_handshake(conn):
@@ -628,6 +761,19 @@ def client_thread(conn, addr, fps):
         print(f"[vizfft] client connected: {addr}")
         interval = 1.0 / fps
         while True:
+            # Drain any pending client->server frames (self-test pings, close,
+            # protocol pings) WITHOUT blocking the frame push. select with a 0
+            # timeout tells us if there's a frame to read this tick.
+            r, _, _ = select.select([conn], [], [], 0)
+            if r:
+                opcode, payload = ws_read_client_frame(conn)
+                if opcode is None or opcode == 0x8:   # EOF or close
+                    break
+                elif opcode == 0x9:                   # ping control -> pong
+                    conn.send(bytes([0x8A, 0x00]))
+                elif opcode in (0x1, 0x2) and payload:  # text/binary app message
+                    _handle_client_message(conn, payload)
+
             with _lock:
                 frame = _latest["frame"]
             if frame:
@@ -642,6 +788,14 @@ def client_thread(conn, addr, fps):
 
 
 def main():
+    # Line-buffer stdout so the helper's log is readable live (the plugin
+    # redirects it to a file, where Python would otherwise block-buffer it and
+    # we'd never see recent lines — which made the loop-glitch impossible to
+    # diagnose). Cheap; the helper logs sparsely.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--shmem", default="/squeezelite-38:f7:cd:c5:1a:2c",
                     help="POSIX shmem name (with leading /), e.g. /squeezelite-AA:BB:...")
@@ -653,18 +807,16 @@ def main():
                          "milliseconds. The plugin writes this on user nudge / "
                          "save / room change. We poll it every 100ms. Missing or "
                          "unparseable file = 0 ms offset.")
-    ap.add_argument("--max-offset-ms", type=int, default=4500,
+    ap.add_argument("--max-offset-ms", type=int, default=2000,
                     help="Cap on offset honoured (and thus on the Python ring "
-                         "buffer size). Defaults to 4500ms — enough for WISA "
-                         "systems and deep-buffered bridges.")
-    ap.add_argument("--baseline-ms", type=int, default=2000,
-                    help="Built-in delay lead (ms). The visualizer renders audio "
-                         "this far back from the live capture edge by default, "
-                         "giving the per-player offset room to move BOTH ways: "
-                         "negative offset pulls visuals earlier (toward the live "
-                         "edge), positive pushes them later. 0 offset = exactly "
-                         "this lead. Costs a one-time fill of this many ms at "
-                         "playback start. Set smaller once real offsets are known.")
+                         "buffer size). Defaults to 2000ms — the delay-only 2s "
+                         "buffer used to delay the visuals to match the room.")
+    ap.add_argument("--baseline-ms", type=int, default=0,
+                    help="Constant delay lead (ms) added to every offset. "
+                         "Defaults to 0: offset 0 then reads at the live capture "
+                         "edge (zero added latency, the passthrough start point) "
+                         "and a positive offset delays the visuals. Leave at 0 "
+                         "for the delay-only model.")
     ap.add_argument("--selftest", action="store_true",
                     help="Print buffer-index detection + live RMS for 5s and exit")
     args = ap.parse_args()

@@ -34,12 +34,14 @@ sub prefs {
 sub handler {
     my ($class, $client, $params) = @_;
 
+    # Delay-only offset model: 0 = passthrough (visuals at the live capture
+    # edge), positive = delay the visuals to match the room. No negative side.
     my $clampMs = sub {
         my $v = shift // 0;
         $v =~ s/[^\-\d]//g;
         $v = 0 unless $v =~ /^-?\d+$/;
-        $v = -2000 if $v < -2000;
-        $v =  2000 if $v >  2000;
+        $v =    0 if $v <    0;
+        $v = 2000 if $v > 2000;
         return int($v);   # int() guarantees JSON encodes a number, not "string"
     };
 
